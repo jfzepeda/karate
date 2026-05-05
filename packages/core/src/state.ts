@@ -1,0 +1,513 @@
+import type {
+  AppState,
+  Category,
+  Discipline,
+  MatchState,
+  TournamentSettings,
+  ActiveMatchRef,
+  AnyTree,
+  StandardTree,
+  PlayinTree,
+  SeriesTree,
+  RRTree,
+  Match,
+  Subcategory,
+  MatchPath,
+  MatchResult,
+} from "./types";
+import { CATEGORY_SEEDS, DEFAULT_KEYS, generateRoster } from "./data";
+import { rebuildCategorySubcategories } from "./subcategories";
+
+export const STORAGE_KEY = "karate-state-v3";
+export const TIMER_OWNER_KEY = "karate-timer-owner-v3";
+export const CHANNEL_NAME = "karate-state-v3";
+
+export function buildInitialState(): AppState {
+  const settings: TournamentSettings = {
+    subcategorySize: 4,
+    disciplineMode: "combat",
+  };
+  const categories: Record<string, Category> = {};
+  for (const seed of CATEGORY_SEEDS) {
+    const roster = generateRoster(seed.seed, seed.count);
+    const cat: Category = {
+      id: seed.id,
+      name: seed.name,
+      competitors: roster,
+      subcategories: [],
+      activeSubcategoryId: null,
+      champion: {},
+    };
+    rebuildCategorySubcategories(cat, settings);
+    categories[seed.id] = cat;
+  }
+  return {
+    tournament: {
+      settings,
+      categories,
+      categoryOrder: CATEGORY_SEEDS.map((c) => c.id),
+      activeCategoryId: CATEGORY_SEEDS[0].id,
+    },
+    match: {
+      blueName: "",
+      redName: "",
+      bluePoints: 0,
+      redPoints: 0,
+      bluePenalties: 0,
+      redPenalties: 0,
+      blueAdvantage: false,
+      redAdvantage: false,
+      blueEliminated: false,
+      redEliminated: false,
+      discipline: null,
+      activeMatchRef: null,
+    },
+    timer: {
+      duration: 120,
+      remaining: 120,
+      running: false,
+      finished: false,
+    },
+    settings: {
+      defaultDuration: 120,
+      keys: { ...DEFAULT_KEYS },
+    },
+    jury: null,
+  };
+}
+
+export function loadState(storage: Storage | null): AppState {
+  if (!storage) return buildInitialState();
+  try {
+    const raw = storage.getItem(STORAGE_KEY);
+    if (!raw) return buildInitialState();
+    const parsed = JSON.parse(raw) as AppState;
+    if (
+      !parsed ||
+      !parsed.tournament ||
+      !parsed.tournament.settings ||
+      !parsed.match ||
+      !parsed.timer ||
+      !parsed.settings
+    ) {
+      return buildInitialState();
+    }
+    parsed.settings.keys = {
+      ...DEFAULT_KEYS,
+      ...(parsed.settings.keys ?? {}),
+    };
+    if (typeof parsed.jury === "undefined") parsed.jury = null;
+    return parsed;
+  } catch {
+    return buildInitialState();
+  }
+}
+
+// =============================================================
+// Lookups
+// =============================================================
+export function getCategory(state: AppState, catId: string): Category | null {
+  return state.tournament.categories[catId] ?? null;
+}
+export function getSubcategory(
+  state: AppState,
+  catId: string,
+  subId: string
+): Subcategory | null {
+  const cat = getCategory(state, catId);
+  if (!cat) return null;
+  return cat.subcategories.find((s) => s.id === subId) ?? null;
+}
+export function getMatchByRef(
+  state: AppState,
+  ref: ActiveMatchRef | null
+): Match | null {
+  if (!ref) return null;
+  const sub = getSubcategory(state, ref.categoryId, ref.subcategoryId);
+  if (!sub) return null;
+  const tree = sub.trees[ref.discipline];
+  if (!tree) return null;
+  const path = ref.path;
+  if (sub.type === "standard") {
+    const t = tree as StandardTree;
+    if (path.kind !== "std") return null;
+    return t.rounds[path.round]?.[path.idx] ?? null;
+  }
+  if (sub.type === "playin") {
+    const t = tree as PlayinTree;
+    if (path.kind === "playin") return t.extra;
+    if (path.kind !== "std") return null;
+    return t.bracket.rounds[path.round]?.[path.idx] ?? null;
+  }
+  if (sub.type === "series") {
+    const t = tree as SeriesTree;
+    if (path.kind !== "series") return null;
+    return t.matches[path.idx] ?? null;
+  }
+  if (sub.type === "roundrobin") {
+    const t = tree as RRTree;
+    if (path.kind !== "rr") return null;
+    return t.matches.find((m) => m.pair === path.pair) ?? null;
+  }
+  return null;
+}
+
+// =============================================================
+// Status helpers
+// =============================================================
+export function treeComplete(type: string, tree: AnyTree): boolean {
+  if (type === "standard") return !!(tree as StandardTree).champion;
+  if (type === "playin") return !!(tree as PlayinTree).bracket.champion;
+  if (type === "series") return !!(tree as SeriesTree).winner;
+  if (type === "roundrobin") return !!(tree as RRTree).winner;
+  return false;
+}
+export function treeHasProgress(type: string, tree: AnyTree): boolean {
+  if (type === "standard")
+    return (tree as StandardTree).rounds.some((r) =>
+      r.some((m) => m.winner)
+    );
+  if (type === "playin") {
+    const t = tree as PlayinTree;
+    if (t.extra.winner) return true;
+    return t.bracket.rounds.some((r) => r.some((m) => m.winner));
+  }
+  if (type === "series" || type === "roundrobin")
+    return (tree as SeriesTree | RRTree).matches.some((m) => m.winner);
+  return false;
+}
+export function subcategoryStatus(
+  sub: Subcategory
+): "pending" | "in-progress" | "complete" {
+  const trees = Object.values(sub.trees) as AnyTree[];
+  if (trees.length === 0) return "pending";
+  const allComplete = trees.every((t) => treeComplete(sub.type, t));
+  if (allComplete) return "complete";
+  return trees.some((t) => treeHasProgress(sub.type, t))
+    ? "in-progress"
+    : "pending";
+}
+
+// =============================================================
+// Mutations: tournament settings
+// =============================================================
+export function rebuildAllSubcategories(state: AppState): void {
+  for (const cat of Object.values(state.tournament.categories)) {
+    rebuildCategorySubcategories(cat, state.tournament.settings);
+  }
+}
+
+// =============================================================
+// Mutations: scoreboard
+// =============================================================
+export function captureSb(m: MatchState): MatchResult {
+  return {
+    p1: {
+      name: m.blueName,
+      points: m.bluePoints,
+      penalties: m.bluePenalties,
+      advantage: m.blueAdvantage,
+    },
+    p2: {
+      name: m.redName,
+      points: m.redPoints,
+      penalties: m.redPenalties,
+      advantage: m.redAdvantage,
+    },
+  };
+}
+
+export function resetLiveScoreboard(state: AppState): void {
+  state.match.blueName = "";
+  state.match.redName = "";
+  state.match.bluePoints = 0;
+  state.match.redPoints = 0;
+  state.match.bluePenalties = 0;
+  state.match.redPenalties = 0;
+  state.match.blueAdvantage = false;
+  state.match.redAdvantage = false;
+  state.match.blueEliminated = false;
+  state.match.redEliminated = false;
+  state.match.discipline = null;
+  state.match.activeMatchRef = null;
+  state.timer.duration = state.settings.defaultDuration;
+  state.timer.remaining = state.settings.defaultDuration;
+  state.timer.running = false;
+  state.timer.finished = false;
+}
+
+export function loadMatchToScoreboardImpl(
+  state: AppState,
+  ref: ActiveMatchRef
+): boolean {
+  const m = getMatchByRef(state, ref);
+  if (!m || !m.p1 || !m.p2 || m.winner) return false;
+  state.match.blueName = m.p1;
+  state.match.redName = m.p2;
+  state.match.bluePoints = 0;
+  state.match.redPoints = 0;
+  state.match.bluePenalties = 0;
+  state.match.redPenalties = 0;
+  state.match.blueAdvantage = false;
+  state.match.redAdvantage = false;
+  state.match.blueEliminated = false;
+  state.match.redEliminated = false;
+  state.match.discipline = ref.discipline;
+  state.match.activeMatchRef = ref;
+  state.timer.duration = state.settings.defaultDuration;
+  state.timer.remaining = state.settings.defaultDuration;
+  state.timer.running = false;
+  state.timer.finished = false;
+  return true;
+}
+
+// =============================================================
+// Mutations: bracket finalization
+// =============================================================
+export function propagateBracketWinner(
+  bracket: StandardTree,
+  round: number,
+  idx: number,
+  winnerName: string
+): void {
+  if (round + 1 < bracket.rounds.length) {
+    const next = bracket.rounds[round + 1][Math.floor(idx / 2)];
+    if (idx % 2 === 0) next.p1 = winnerName;
+    else next.p2 = winnerName;
+  } else {
+    bracket.champion = winnerName;
+  }
+}
+
+export function finalizeMatchByRef(
+  state: AppState,
+  ref: ActiveMatchRef,
+  winnerName: string,
+  loserName: string,
+  juryUsed: boolean
+): void {
+  const sub = getSubcategory(state, ref.categoryId, ref.subcategoryId);
+  if (!sub) return;
+  const tree = sub.trees[ref.discipline];
+  if (!tree) return;
+  const m = getMatchByRef(state, ref);
+  if (!m) return;
+  m.winner = winnerName;
+  m.eliminated = loserName;
+  m.jury = juryUsed;
+  m.result = captureSb(state.match);
+
+  if (sub.type === "standard") {
+    if (ref.path.kind === "std") {
+      propagateBracketWinner(
+        tree as StandardTree,
+        ref.path.round,
+        ref.path.idx,
+        winnerName
+      );
+    }
+  } else if (sub.type === "playin") {
+    const t = tree as PlayinTree;
+    if (ref.path.kind === "playin") {
+      const r0 = t.bracket.rounds[0];
+      r0[r0.length - 1].p2 = winnerName;
+    } else if (ref.path.kind === "std") {
+      propagateBracketWinner(
+        t.bracket,
+        ref.path.round,
+        ref.path.idx,
+        winnerName
+      );
+    }
+  } else if (sub.type === "series") {
+    const t = tree as SeriesTree;
+    if (t.matches.every((mm) => mm.winner)) {
+      finalizeSeries(state, sub, ref.discipline);
+    }
+  } else if (sub.type === "roundrobin") {
+    const t = tree as RRTree;
+    if (t.matches.every((mm) => mm.winner)) {
+      finalizeRR(state, sub, ref.discipline);
+    }
+  }
+  resetLiveScoreboard(state);
+}
+
+/**
+ * Returns 'jury' if a jury decision is required, otherwise null.
+ */
+export function finalizeSeries(
+  state: AppState,
+  sub: Subcategory,
+  discipline: Discipline
+): "jury" | null {
+  const tree = sub.trees[discipline] as SeriesTree;
+  const [a, b] = sub.competitors;
+  const winsA = tree.matches.filter((m) => m.winner === a).length;
+  const winsB = tree.matches.filter((m) => m.winner === b).length;
+  if (winsA === 2) {
+    tree.winner = a;
+    return null;
+  }
+  if (winsB === 2) {
+    tree.winner = b;
+    return null;
+  }
+  const totals: Record<string, number> = { [a]: 0, [b]: 0 };
+  const pens: Record<string, number> = { [a]: 0, [b]: 0 };
+  const sens: Record<string, number> = { [a]: 0, [b]: 0 };
+  for (const m of tree.matches) {
+    if (!m.result) continue;
+    totals[m.p1!] += m.result.p1.points;
+    totals[m.p2!] += m.result.p2.points;
+    pens[m.p1!] += m.result.p1.penalties;
+    pens[m.p2!] += m.result.p2.penalties;
+    if (m.result.p1.advantage) sens[m.p1!]++;
+    if (m.result.p2.advantage) sens[m.p2!]++;
+  }
+  if (totals[a] !== totals[b]) {
+    tree.winner = totals[a] > totals[b] ? a : b;
+    return null;
+  }
+  if (pens[a] !== pens[b]) {
+    tree.winner = pens[a] < pens[b] ? a : b;
+    return null;
+  }
+  if (sens[a] !== sens[b]) {
+    tree.winner = sens[a] > sens[b] ? a : b;
+    return null;
+  }
+  state.jury = {
+    competitors: [a, b],
+    context: {
+      kind: "series-final",
+      subRef: {
+        categoryId: sub.categoryId,
+        subcategoryId: sub.id,
+        discipline,
+      },
+    },
+  };
+  return "jury";
+}
+
+export function finalizeRR(
+  state: AppState,
+  sub: Subcategory,
+  discipline: Discipline
+): "jury" | null {
+  const tree = sub.trees[discipline] as RRTree;
+  const comps = sub.competitors;
+  const stats: Record<string, {
+    name: string; w: number; l: number; pts: number; pen: number; senshu: number;
+  }> = {};
+  for (const n of comps) stats[n] = { name: n, w: 0, l: 0, pts: 0, pen: 0, senshu: 0 };
+  for (const m of tree.matches) {
+    if (!m.result) continue;
+    stats[m.p1!].pts += m.result.p1.points;
+    stats[m.p2!].pts += m.result.p2.points;
+    stats[m.p1!].pen += m.result.p1.penalties;
+    stats[m.p2!].pen += m.result.p2.penalties;
+    if (m.result.p1.advantage) stats[m.p1!].senshu++;
+    if (m.result.p2.advantage) stats[m.p2!].senshu++;
+    if (m.winner === m.p1) {
+      stats[m.p1!].w++;
+      stats[m.p2!].l++;
+    } else if (m.winner === m.p2) {
+      stats[m.p2!].w++;
+      stats[m.p1!].l++;
+    }
+  }
+  const ranked = comps
+    .map((n) => stats[n])
+    .sort((x, y) => {
+      if (y.w !== x.w) return y.w - x.w;
+      if (y.pts !== x.pts) return y.pts - x.pts;
+      if (x.pen !== y.pen) return x.pen - y.pen;
+      if (y.senshu !== x.senshu) return y.senshu - x.senshu;
+      return 0;
+    });
+  tree.rankings = ranked;
+  const top = ranked[0];
+  const tied = ranked.filter(
+    (r) =>
+      r.w === top.w &&
+      r.pts === top.pts &&
+      r.pen === top.pen &&
+      r.senshu === top.senshu
+  );
+  if (tied.length > 1) {
+    state.jury = {
+      competitors: [tied[0].name, tied[1].name],
+      context: {
+        kind: "rr-final",
+        subRef: {
+          categoryId: sub.categoryId,
+          subcategoryId: sub.id,
+          discipline,
+        },
+      },
+    };
+    return "jury";
+  }
+  tree.winner = top.name;
+  return null;
+}
+
+// =============================================================
+// Misc
+// =============================================================
+export function describeRefLabel(
+  state: AppState,
+  ref: ActiveMatchRef
+): string {
+  const sub = getSubcategory(state, ref.categoryId, ref.subcategoryId);
+  if (!sub) return "?";
+  const d =
+    Object.keys(sub.trees).length > 1
+      ? ref.discipline.charAt(0).toUpperCase() + " · "
+      : "";
+  if (ref.path.kind === "playin") return d + "Play-in · " + sub.label;
+  if (ref.path.kind === "series")
+    return d + sub.label + " M" + (ref.path.idx + 1);
+  if (ref.path.kind === "rr") {
+    const map = { ab: "A vs B", ac: "A vs C", bc: "B vs C" } as const;
+    return d + sub.label + " · " + map[ref.path.pair];
+  }
+  if (ref.path.kind === "std") {
+    const tree =
+      sub.type === "playin"
+        ? (sub.trees[ref.discipline] as PlayinTree).bracket
+        : (sub.trees[ref.discipline] as StandardTree);
+    const total = tree.rounds.length;
+    return (
+      d +
+      sub.label +
+      " · " +
+      roundLabel(ref.path.round, total) +
+      " M" +
+      (ref.path.idx + 1)
+    );
+  }
+  return d + sub.label;
+}
+
+export function roundLabel(roundIdx: number, totalRounds: number): string {
+  const fromEnd = totalRounds - 1 - roundIdx;
+  if (fromEnd === 0) return "Final";
+  if (fromEnd === 1) return "Semifinal";
+  if (fromEnd === 2) return "Quarterfinal";
+  if (fromEnd === 3) return "Round of 16";
+  return `Round ${roundIdx + 1}`;
+}
+
+export function samePath(a: MatchPath | undefined, b: MatchPath | undefined): boolean {
+  if (!a || !b) return false;
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "std" && b.kind === "std")
+    return a.round === b.round && a.idx === b.idx;
+  if (a.kind === "series" && b.kind === "series") return a.idx === b.idx;
+  if (a.kind === "rr" && b.kind === "rr") return a.pair === b.pair;
+  if (a.kind === "playin" && b.kind === "playin") return true;
+  return false;
+}
