@@ -10,10 +10,10 @@ import { TournamentSettingsModal } from "@/components/tournament-settings-modal"
 export default function AdminPage() {
   const { state, setActiveDiscipline } = useStore();
   const [tournModalOpen, setTournModalOpen] = useState(false);
-  const cat = state.tournament.categories[state.tournament.activeCategoryId];
-  const sub = cat?.subcategories.find(
-    (s) => s.id === cat.activeSubcategoryId
-  ) || null;
+  const activeCatId = state.tournament.activeCategoryId;
+  const cat = activeCatId ? state.tournament.categories[activeCatId] : null;
+  const sub =
+    cat?.subcategories.find((s) => s.id === cat.activeSubcategoryId) ?? null;
 
   const champions: Partial<Record<Discipline, string>> = {};
   if (sub) {
@@ -33,15 +33,25 @@ export default function AdminPage() {
   }
   const champKeys = Object.keys(champions);
 
+  const noParticipants = state.tournament.participants.length === 0;
+
   return (
     <section id="view-admin">
       <AdminSidebar onOpenTournamentSettings={() => setTournModalOpen(true)} />
       <div className="admin-main">
         <div className="admin-header">
           <div>
-            <h2>{cat ? cat.name : "Select a category"}</h2>
+            <h2>
+              {noParticipants
+                ? "No participants yet"
+                : cat
+                ? cat.name
+                : "Select a category"}
+            </h2>
             <div className="admin-subtitle">
-              {cat
+              {noParticipants
+                ? "Open Tournament Settings to load a CSV or add participants"
+                : cat
                 ? sub
                   ? `${sub.label} · ${sub.competitors.length} competitors`
                   : `${cat.competitors.length} total competitors · ${cat.subcategories.length} subcategories`

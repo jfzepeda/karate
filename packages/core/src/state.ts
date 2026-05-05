@@ -1,6 +1,5 @@
 import type {
   AppState,
-  Category,
   Discipline,
   MatchState,
   TournamentSettings,
@@ -12,41 +11,31 @@ import type {
   RRTree,
   Match,
   Subcategory,
+  Category,
   MatchPath,
   MatchResult,
+  Participant,
 } from "./types";
-import { CATEGORY_SEEDS, DEFAULT_KEYS, generateRoster } from "./data";
-import { rebuildCategorySubcategories } from "./subcategories";
+import { DEFAULT_KEYS } from "./data";
+import { rebuildCategoriesFromParticipants } from "./categories";
+import { newParticipantId } from "./csv";
 
-export const STORAGE_KEY = "karate-state-v3";
-export const TIMER_OWNER_KEY = "karate-timer-owner-v3";
-export const CHANNEL_NAME = "karate-state-v3";
+export const STORAGE_KEY = "karate-state-v4";
+export const TIMER_OWNER_KEY = "karate-timer-owner-v4";
+export const CHANNEL_NAME = "karate-state-v4";
 
 export function buildInitialState(): AppState {
   const settings: TournamentSettings = {
     subcategorySize: 4,
     disciplineMode: "combat",
   };
-  const categories: Record<string, Category> = {};
-  for (const seed of CATEGORY_SEEDS) {
-    const roster = generateRoster(seed.seed, seed.count);
-    const cat: Category = {
-      id: seed.id,
-      name: seed.name,
-      competitors: roster,
-      subcategories: [],
-      activeSubcategoryId: null,
-      champion: {},
-    };
-    rebuildCategorySubcategories(cat, settings);
-    categories[seed.id] = cat;
-  }
   return {
     tournament: {
       settings,
-      categories,
-      categoryOrder: CATEGORY_SEEDS.map((c) => c.id),
-      activeCategoryId: CATEGORY_SEEDS[0].id,
+      participants: [],
+      categories: {},
+      categoryOrder: [],
+      activeCategoryId: null,
     },
     match: {
       blueName: "",
@@ -86,6 +75,7 @@ export function loadState(storage: Storage | null): AppState {
       !parsed ||
       !parsed.tournament ||
       !parsed.tournament.settings ||
+      !Array.isArray(parsed.tournament.participants) ||
       !parsed.match ||
       !parsed.timer ||
       !parsed.settings
@@ -189,12 +179,49 @@ export function subcategoryStatus(
 }
 
 // =============================================================
-// Mutations: tournament settings
+// Mutations: tournament + participants
 // =============================================================
 export function rebuildAllSubcategories(state: AppState): void {
-  for (const cat of Object.values(state.tournament.categories)) {
-    rebuildCategorySubcategories(cat, state.tournament.settings);
-  }
+  const result = rebuildCategoriesFromParticipants(
+    state.tournament.participants,
+    state.tournament.settings,
+    state.tournament.activeCategoryId
+  );
+  state.tournament.categories = result.categories;
+  state.tournament.categoryOrder = result.categoryOrder;
+  state.tournament.activeCategoryId = result.activeCategoryId;
+}
+
+export function replaceParticipants(
+  state: AppState,
+  list: Omit<Participant, "id">[]
+): void {
+  state.tournament.participants = list.map((p) => ({
+    ...p,
+    id: newParticipantId(),
+  }));
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
+}
+
+export function addParticipant(
+  state: AppState,
+  p: Omit<Participant, "id">
+): void {
+  state.tournament.participants.push({ ...p, id: newParticipantId() });
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
+}
+
+export function removeParticipant(state: AppState, id: string): void {
+  state.tournament.participants = state.tournament.participants.filter(
+    (p) => p.id !== id
+  );
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
 }
 
 // =============================================================
@@ -333,9 +360,6 @@ export function finalizeMatchByRef(
   resetLiveScoreboard(state);
 }
 
-/**
- * Returns 'jury' if a jury decision is required, otherwise null.
- */
 export function finalizeSeries(
   state: AppState,
   sub: Subcategory,
@@ -398,10 +422,12 @@ export function finalizeRR(
 ): "jury" | null {
   const tree = sub.trees[discipline] as RRTree;
   const comps = sub.competitors;
-  const stats: Record<string, {
-    name: string; w: number; l: number; pts: number; pen: number; senshu: number;
-  }> = {};
-  for (const n of comps) stats[n] = { name: n, w: 0, l: 0, pts: 0, pen: 0, senshu: 0 };
+  const stats: Record<
+    string,
+    { name: string; w: number; l: number; pts: number; pen: number; senshu: number }
+  > = {};
+  for (const n of comps)
+    stats[n] = { name: n, w: 0, l: 0, pts: 0, pen: 0, senshu: 0 };
   for (const m of tree.matches) {
     if (!m.result) continue;
     stats[m.p1!].pts += m.result.p1.points;

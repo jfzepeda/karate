@@ -8,6 +8,26 @@ export type SubcategoryType =
   | "series"
   | "roundrobin";
 
+export type BeltColor =
+  | "white"
+  | "yellow"
+  | "orange"
+  | "green"
+  | "blue"
+  | "purple"
+  | "brown"
+  | "black";
+
+export type AgeRange = "4-6" | "7-9" | "10-12" | "13-15" | "16-17" | "adult";
+
+export interface Participant {
+  id: string;
+  nombre: string;
+  apellido: string;
+  beltColor: BeltColor;
+  age: number;
+}
+
 export interface MatchResultSide {
   name: string;
   points: number;
@@ -26,7 +46,6 @@ export interface Match {
   eliminated: string | null;
   jury: boolean;
   result: MatchResult | null;
-  /** Pair label, only present on round-robin matches. */
   pair?: "ab" | "ac" | "bc";
 }
 
@@ -74,6 +93,8 @@ export interface Subcategory {
 export interface Category {
   id: string;
   name: string;
+  beltColor: BeltColor;
+  ageRange: AgeRange;
   competitors: string[];
   subcategories: Subcategory[];
   activeSubcategoryId: string | null;
@@ -172,7 +193,6 @@ export type JuryContext =
   | JuryContextRR;
 
 export interface JuryState {
-  /** [blueName, redName] */
   competitors: [string, string];
   context: JuryContext;
 }
@@ -180,9 +200,10 @@ export interface JuryState {
 export interface AppState {
   tournament: {
     settings: TournamentSettings;
+    participants: Participant[];
     categories: Record<string, Category>;
     categoryOrder: string[];
-    activeCategoryId: string;
+    activeCategoryId: string | null;
   };
   match: MatchState;
   timer: TimerState;

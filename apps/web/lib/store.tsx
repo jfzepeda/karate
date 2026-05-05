@@ -20,18 +20,20 @@ import {
   CHANNEL_NAME,
   STORAGE_KEY,
   TIMER_OWNER_KEY,
+  addParticipant as addParticipantImpl,
   buildInitialState,
   computeWinner,
   finalizeMatchByRef,
-  finalizeRR,
-  finalizeSeries,
   getMatchByRef,
   getSubcategory,
   loadMatchToScoreboardImpl,
   loadState,
   rebuildAllSubcategories,
+  removeParticipant as removeParticipantImpl,
+  replaceParticipants as replaceParticipantsImpl,
   resetLiveScoreboard,
 } from "@karate/core";
+import type { Participant } from "@karate/core";
 
 type Updater = (s: AppState) => void;
 
@@ -53,6 +55,9 @@ interface StoreApi {
     size: SubcategorySize,
     mode: DisciplineMode
   ) => boolean;
+  replaceParticipants: (list: Omit<Participant, "id">[]) => void;
+  addParticipant: (p: Omit<Participant, "id">) => void;
+  removeParticipant: (id: string) => void;
   resetScoreboard: () => void;
   eliminate: (side: "blue" | "red") => void;
   addPoints: (side: "blue" | "red", n: number) => void;
@@ -276,6 +281,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
         return true;
       },
+      replaceParticipants: (list) =>
+        update((s) => replaceParticipantsImpl(s, list)),
+      addParticipant: (p) =>
+        update((s) => addParticipantImpl(s, p)),
+      removeParticipant: (id) =>
+        update((s) => removeParticipantImpl(s, id)),
       resetScoreboard: () => {
         const ok =
           typeof window !== "undefined"
