@@ -6,6 +6,23 @@ import { useStore } from "@/lib/store";
 import { Scoreboard } from "@/components/scoreboard";
 import { KeyboardHandler } from "@/components/keyboard-handler";
 import { SettingsModal } from "@/components/settings-modal";
+import { isElectron } from "@/lib/api-client";
+
+function openPublicDisplay() {
+  if (typeof window === "undefined") return;
+  // In Electron the preload bridge exposes a helper that asks the main process
+  // to open a fresh BrowserWindow on the next monitor. In web mode we just
+  // open a new tab the user can drag to their second screen.
+  const bridge = (window as unknown as {
+    __KARATE__?: { openPublicWindow?: () => void };
+  }).__KARATE__;
+  if (isElectron() && bridge?.openPublicWindow) {
+    bridge.openPublicWindow();
+    return;
+  }
+  const w = window.open("/public", "_blank", "noopener");
+  if (w) w.focus();
+}
 
 export default function PrivatePage() {
   const {
@@ -36,6 +53,9 @@ export default function PrivatePage() {
         <div className="control-group">
           <button onClick={() => setSettingsOpen(true)}>
             ⚙ Change Settings
+          </button>
+          <button onClick={openPublicDisplay} title="Open the audience scoreboard in a separate window">
+            🖥 Open Public Display
           </button>
         </div>
         <div className="control-group">

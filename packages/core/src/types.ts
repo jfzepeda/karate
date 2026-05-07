@@ -52,6 +52,8 @@ export interface Match {
 export interface StandardTree {
   rounds: Match[][];
   champion: string | null;
+  /** Optional 3rd-place playoff between the two semifinal losers. */
+  thirdPlace?: Match | null;
 }
 export interface PlayinTree {
   extra: Match;
@@ -93,6 +95,9 @@ export interface Subcategory {
 export interface Category {
   id: string;
   name: string;
+  /**
+   * Primary belt color used for sorting/coloring (first allowed belt of the def, or "white" fallback).
+   */
   beltColor: BeltColor;
   ageRange: AgeRange;
   competitors: string[];
@@ -101,9 +106,28 @@ export interface Category {
   champion: Partial<Record<Discipline, string>>;
 }
 
+/**
+ * A user-editable category definition. Acts as the matching rule used to decide
+ * which Category a Participant belongs to (by belt + age range).
+ *
+ * `belts` is multi-select; an empty array means "any belt".
+ * `maxAge: null` means "no upper bound" (i.e., adult open).
+ */
+export interface CategoryDef {
+  id: string;
+  name: string;
+  belts: BeltColor[];
+  minAge: number;
+  maxAge: number | null;
+}
+
 export interface TournamentSettings {
   subcategorySize: SubcategorySize;
   disciplineMode: DisciplineMode;
+  /** Number of physical competition areas (1-10). */
+  areaCount: number;
+  /** Auto-finish a combat match when one side leads by this many points (0 = disabled). */
+  pointDifference?: number;
 }
 
 export interface MatchPathStd {
@@ -122,11 +146,15 @@ export interface MatchPathRR {
   kind: "rr";
   pair: "ab" | "ac" | "bc";
 }
+export interface MatchPathThird {
+  kind: "3rd";
+}
 export type MatchPath =
   | MatchPathStd
   | MatchPathPlayin
   | MatchPathSeries
-  | MatchPathRR;
+  | MatchPathRR
+  | MatchPathThird;
 
 export interface ActiveMatchRef {
   categoryId: string;
@@ -197,13 +225,29 @@ export interface JuryState {
   context: JuryContext;
 }
 
+/**
+ * Maps each subcategory id to its assigned area index (0-based).
+ * Subcategories with no entry are unassigned (visible only to superadmin).
+ */
+export type AreaAssignments = Record<string, number>;
+
+export interface TournamentMeta {
+  /** Random seed used for the latest seeding pass (Mulberry32). */
+  seed: number;
+  /** Logo URL the app should display (server-relative or absolute). null = no logo. */
+  logoUrl: string | null;
+}
+
 export interface AppState {
   tournament: {
     settings: TournamentSettings;
+    categoryDefs: CategoryDef[];
     participants: Participant[];
     categories: Record<string, Category>;
     categoryOrder: string[];
     activeCategoryId: string | null;
+    areaAssignments: AreaAssignments;
+    meta: TournamentMeta;
   };
   match: MatchState;
   timer: TimerState;

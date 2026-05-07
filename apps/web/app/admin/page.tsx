@@ -1,15 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import type { Discipline, PlayinTree, RRTree, SeriesTree, StandardTree } from "@karate/core";
 import { useStore } from "@/lib/store";
+import { useAuth } from "@/lib/auth-context";
+import { useArea } from "@/lib/area-context";
 import { AdminSidebar } from "@/components/sidebar";
 import { BracketRenderer } from "@/components/bracket";
 import { TournamentSettingsModal } from "@/components/tournament-settings-modal";
 
 export default function AdminPage() {
   const { state, setActiveDiscipline } = useStore();
+  const { hasRole } = useAuth();
+  const { current: areaIdx } = useArea();
+  const router = useRouter();
   const [tournModalOpen, setTournModalOpen] = useState(false);
+  const isReferee = !hasRole("superadmin");
+  const needsArea = isReferee && areaIdx === null;
+  useEffect(() => {
+    if (needsArea) router.replace("/area-select");
+  }, [needsArea, router]);
   const activeCatId = state.tournament.activeCategoryId;
   const cat = activeCatId ? state.tournament.categories[activeCatId] : null;
   const sub =
@@ -34,6 +45,9 @@ export default function AdminPage() {
   const champKeys = Object.keys(champions);
 
   const noParticipants = state.tournament.participants.length === 0;
+  const noParticipantsCopy = isReferee
+    ? "Waiting for the tournament administrator to load competitors."
+    : "Open Tournament Settings to load a CSV or add participants.";
 
   return (
     <section id="view-admin">
@@ -50,7 +64,7 @@ export default function AdminPage() {
             </h2>
             <div className="admin-subtitle">
               {noParticipants
-                ? "Open Tournament Settings to load a CSV or add participants"
+                ? noParticipantsCopy
                 : cat
                 ? sub
                   ? `${sub.label} · ${sub.competitors.length} competitors`

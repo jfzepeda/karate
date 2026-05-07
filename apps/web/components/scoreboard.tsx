@@ -116,11 +116,37 @@ export function Scoreboard({ state, variant }: Props) {
     </div>
   );
 
+  const logoUrl = state.tournament.meta?.logoUrl ?? null;
   return (
     <>
       <div className={`match-type-label ${m.discipline || ""}`}>
         {matchType}
       </div>
+      {logoUrl ? (
+        <div
+          className="scoreboard-logo"
+          style={{
+            position: "absolute",
+            top: variant === "public" ? 18 : 8,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 5,
+            pointerEvents: "none",
+          }}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={logoUrl}
+            alt=""
+            style={{
+              maxHeight: variant === "public" ? 80 : 48,
+              maxWidth: 220,
+              objectFit: "contain",
+              filter: "drop-shadow(0 4px 8px rgba(0,0,0,0.4))",
+            }}
+          />
+        </div>
+      ) : null}
       <div className="split">
         {variant === "public" ? (
           <>

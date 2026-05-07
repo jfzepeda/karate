@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { StoreProvider } from "@/lib/store";
+import { AuthProvider } from "@/lib/auth-context";
+import { AreaProvider } from "@/lib/area-context";
 import { TopTabs } from "@/components/top-tabs";
 import { JuryModal } from "@/components/jury-modal";
 import { BodyClassSync } from "@/components/body-class-sync";
@@ -18,12 +20,16 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
-        <StoreProvider>
-          <BodyClassSync />
-          <TopTabs />
-          {children}
-          <JuryModal />
-        </StoreProvider>
+        <AuthProvider>
+          <StoreProvider>
+            <AreaProvider>
+              <BodyClassSync />
+              <TopTabs />
+              {children}
+              <JuryModal />
+            </AreaProvider>
+          </StoreProvider>
+        </AuthProvider>
       </body>
     </html>
   );

@@ -1,0 +1,65 @@
+{
+  "name": "@karate/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "main": "main.js",
+  "description": "Karate Tournament desktop wrapper (Electron + bundled server + Next.js export)",
+  "scripts": {
+    "build:server": "pnpm --filter @karate/server build",
+    "build:web": "cross-env KARATE_EXPORT=1 pnpm --filter @karate/web build",
+    "prepackage": "pnpm build:server && pnpm build:web",
+    "dev": "electron .",
+    "package": "pnpm prepackage && electron-builder",
+    "package:mac": "pnpm prepackage && electron-builder --mac dmg",
+    "package:win": "pnpm prepackage && electron-builder --win nsis",
+    "package:linux": "pnpm prepackage && electron-builder --linux AppImage",
+    "typecheck": "echo \"(no TS in desktop)\""
+  },
+  "dependencies": {
+    "@karate/server": "workspace:*"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^33.0.2",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "io.karate.tournament",
+    "productName": "Karate Tournament",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "server/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../web/out",
+        "to": "renderer",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../server/dist",
+        "to": "server",
+        "filter": ["**/*"]
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.sports",
+      "target": ["dmg"]
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Sports"
+    }
+  }
+}

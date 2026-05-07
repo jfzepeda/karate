@@ -1,5 +1,6 @@
 import type {
   AppState,
+  CategoryDef,
   Discipline,
   MatchState,
   TournamentSettings,
@@ -15,27 +16,38 @@ import type {
   MatchPath,
   MatchResult,
   Participant,
+  AreaAssignments,
 } from "./types";
 import { DEFAULT_KEYS } from "./data";
 import { rebuildCategoriesFromParticipants } from "./categories";
 import { newParticipantId } from "./csv";
+import { defaultCategoryDefs } from "./category-defs";
+import { generateRandomSeed } from "./seeding";
+import { buildAreaPlan } from "./areas";
 
-export const STORAGE_KEY = "karate-state-v4";
-export const TIMER_OWNER_KEY = "karate-timer-owner-v4";
-export const CHANNEL_NAME = "karate-state-v4";
+export const STORAGE_KEY = "karate-state-v5";
+export const TIMER_OWNER_KEY = "karate-timer-owner-v5";
+export const CHANNEL_NAME = "karate-state-v5";
 
 export function buildInitialState(): AppState {
   const settings: TournamentSettings = {
     subcategorySize: 4,
     disciplineMode: "combat",
+    areaCount: 1,
   };
   return {
     tournament: {
       settings,
+      categoryDefs: defaultCategoryDefs(),
       participants: [],
       categories: {},
       categoryOrder: [],
       activeCategoryId: null,
+      areaAssignments: {},
+      meta: {
+        seed: generateRandomSeed(),
+        logoUrl: null,
+      },
     },
     match: {
       blueName: "",
@@ -87,6 +99,21 @@ export function loadState(storage: Storage | null): AppState {
       ...(parsed.settings.keys ?? {}),
     };
     if (typeof parsed.jury === "undefined") parsed.jury = null;
+    if (!Array.isArray(parsed.tournament.categoryDefs) || parsed.tournament.categoryDefs.length === 0) {
+      parsed.tournament.categoryDefs = defaultCategoryDefs();
+    }
+    if (typeof parsed.tournament.settings.areaCount !== "number") {
+      parsed.tournament.settings.areaCount = 1;
+    }
+    if (!parsed.tournament.areaAssignments || typeof parsed.tournament.areaAssignments !== "object") {
+      parsed.tournament.areaAssignments = {};
+    }
+    if (!parsed.tournament.meta || typeof parsed.tournament.meta !== "object") {
+      parsed.tournament.meta = { seed: generateRandomSeed(), logoUrl: null };
+    } else {
+      if (typeof parsed.tournament.meta.seed !== "number") parsed.tournament.meta.seed = generateRandomSeed();
+      if (typeof parsed.tournament.meta.logoUrl === "undefined") parsed.tournament.meta.logoUrl = null;
+    }
     return parsed;
   } catch {
     return buildInitialState();
@@ -185,11 +212,125 @@ export function rebuildAllSubcategories(state: AppState): void {
   const result = rebuildCategoriesFromParticipants(
     state.tournament.participants,
     state.tournament.settings,
-    state.tournament.activeCategoryId
+    state.tournament.categoryDefs,
+    {
+      seed: state.tournament.meta.seed,
+      prevActiveCategoryId: state.tournament.activeCategoryId,
+    }
   );
   state.tournament.categories = result.categories;
   state.tournament.categoryOrder = result.categoryOrder;
   state.tournament.activeCategoryId = result.activeCategoryId;
+  // Drop area assignments for subcategories that no longer exist; keep the rest.
+  const validSubIds = new Set<string>();
+  for (const catId of result.categoryOrder) {
+    const cat = result.categories[catId];
+    if (!cat) continue;
+    for (const sub of cat.subcategories) validSubIds.add(sub.id);
+  }
+  const next: AreaAssignments = {};
+  for (const [id, idx] of Object.entries(state.tournament.areaAssignments)) {
+    if (validSubIds.has(id) && idx < state.tournament.settings.areaCount) {
+      next[id] = idx;
+    }
+  }
+  // Re-run the planner so any unassigned subcategories get a sensible default.
+  state.tournament.areaAssignments = buildAreaPlan(
+    {
+      categoryOrder: state.tournament.categoryOrder,
+      categories: state.tournament.categories,
+      areaCount: state.tournament.settings.areaCount,
+    },
+    next
+  ).assignments;
+}
+
+export function reseed(state: AppState, seed?: number): number {
+  const next = typeof seed === "number" ? seed : generateRandomSeed();
+  state.tournament.meta.seed = next;
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
+  return next;
+}
+
+// =============================================================
+// Category definitions
+// =============================================================
+export function setCategoryDefs(state: AppState, defs: CategoryDef[]): void {
+  state.tournament.categoryDefs = defs.slice();
+  rebuildAllSubcategories(state);
+}
+
+export function addCategoryDef(state: AppState, def: CategoryDef): void {
+  state.tournament.categoryDefs = [...state.tournament.categoryDefs, def];
+  rebuildAllSubcategories(state);
+}
+
+export function updateCategoryDef(state: AppState, def: CategoryDef): void {
+  state.tournament.categoryDefs = state.tournament.categoryDefs.map((d) =>
+    d.id === def.id ? def : d
+  );
+  rebuildAllSubcategories(state);
+}
+
+export function removeCategoryDef(state: AppState, defId: string): void {
+  state.tournament.categoryDefs = state.tournament.categoryDefs.filter(
+    (d) => d.id !== defId
+  );
+  rebuildAllSubcategories(state);
+}
+
+// =============================================================
+// Settings + areas
+// =============================================================
+export function setSubcategorySize(state: AppState, size: 4 | 8 | 16): void {
+  state.tournament.settings.subcategorySize = size;
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
+}
+
+export function setDisciplineMode(state: AppState, mode: TournamentSettings["disciplineMode"]): void {
+  state.tournament.settings.disciplineMode = mode;
+  rebuildAllSubcategories(state);
+  resetLiveScoreboard(state);
+  state.jury = null;
+}
+
+export function setAreaCount(state: AppState, count: number): void {
+  const n = Math.max(1, Math.min(10, Math.floor(count)));
+  state.tournament.settings.areaCount = n;
+  // Drop any assignments that exceed the new count, then re-plan.
+  const filtered: AreaAssignments = {};
+  for (const [id, idx] of Object.entries(state.tournament.areaAssignments)) {
+    if (idx < n) filtered[id] = idx;
+  }
+  state.tournament.areaAssignments = buildAreaPlan(
+    {
+      categoryOrder: state.tournament.categoryOrder,
+      categories: state.tournament.categories,
+      areaCount: n,
+    },
+    filtered
+  ).assignments;
+}
+
+export function assignSubcategoryToArea(
+  state: AppState,
+  subcategoryId: string,
+  areaIndex: number
+): void {
+  const n = state.tournament.settings.areaCount;
+  if (areaIndex < 0 || areaIndex >= n) return;
+  state.tournament.areaAssignments = {
+    ...state.tournament.areaAssignments,
+    [subcategoryId]: areaIndex,
+  };
+}
+
+export function setLogoUrl(state: AppState, url: string | null): void {
+  state.tournament.meta.logoUrl = url;
 }
 
 export function replaceParticipants(
