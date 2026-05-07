@@ -34,6 +34,9 @@ export function TournamentSettingsModal({ open, onClose }: Props) {
   const [mode, setMode] = useState<DisciplineMode>(
     state.tournament.settings.disciplineMode
   );
+  const [pointDiff, setPointDiff] = useState<number>(
+    state.tournament.settings.pointDifference ?? 8
+  );
   const [feedback, setFeedback] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -47,6 +50,7 @@ export function TournamentSettingsModal({ open, onClose }: Props) {
     if (!open) return;
     setSize(state.tournament.settings.subcategorySize);
     setMode(state.tournament.settings.disciplineMode);
+    setPointDiff(state.tournament.settings.pointDifference ?? 8);
     setFeedback("");
     setPNombre("");
     setPApellido("");
@@ -57,11 +61,12 @@ export function TournamentSettingsModal({ open, onClose }: Props) {
   if (!open) return null;
 
   const apply = () => {
-    const ok = applyTournamentSettings(size, mode);
+    const ok = applyTournamentSettings(size, mode, pointDiff);
     if (
       ok ||
       (size === state.tournament.settings.subcategorySize &&
-        mode === state.tournament.settings.disciplineMode)
+        mode === state.tournament.settings.disciplineMode &&
+        pointDiff === (state.tournament.settings.pointDifference ?? 8))
     ) {
       onClose();
     }
@@ -163,6 +168,22 @@ export function TournamentSettingsModal({ open, onClose }: Props) {
               {m === "combat" ? "Combat" : m === "kata" ? "Kata" : "Both"}
             </label>
           ))}
+        </div>
+
+        <h3>Point Difference Win</h3>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <input
+            type="number"
+            min={0}
+            max={20}
+            value={pointDiff}
+            onChange={(e) => setPointDiff(Math.max(0, Number(e.target.value) || 0))}
+            className="duration-input"
+            style={{ width: 72 }}
+          />
+          <span style={{ color: "#888", fontSize: 12 }}>
+            points lead to win automatically (0 = disabled, default 8)
+          </span>
         </div>
 
         <h3>

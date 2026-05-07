@@ -23,6 +23,7 @@ export function KeyboardHandler({ suppress }: Props) {
     addPenalty,
     adjustTimer,
     togglePause,
+    advanceActiveMatch,
   } = useStore();
   const [tick, setTick] = useState(0);
   const inputRef = useRef<InputState>({
@@ -69,40 +70,53 @@ export function KeyboardHandler({ suppress }: Props) {
         typeof s === "string" && s.length === 1 ? s.toLowerCase() : s;
       const isKata = state.match.discipline === "kata";
 
+      // Prevent browser navigation/scroll for any key our app owns,
+      // regardless of game state (before isKata / selected guards).
+      const ownedKeys = new Set([
+        k.pauseTimer, k.addSecond, k.subSecond, k.undo, "Enter",
+        k.add1, k.add2, k.add3,
+        norm(k.selectRed), norm(k.selectBlue),
+        norm(k.senshu), norm(k.penalty),
+      ]);
+      if (ownedKeys.has(lk) || ownedKeys.has(key)) e.preventDefault();
+
       if (key === k.pauseTimer || (k.pauseTimer === " " && key === " ")) {
         if (isKata) return;
-        e.preventDefault();
         togglePause();
         return;
       }
       if (key === k.addSecond) {
         if (isKata) return;
-        e.preventDefault();
         adjustTimer(1);
         return;
       }
       if (key === k.subSecond) {
         if (isKata) return;
-        e.preventDefault();
         adjustTimer(-1);
         return;
       }
       if (lk === norm(k.selectRed)) {
-        e.preventDefault();
         select("red");
         return;
       }
       if (lk === norm(k.selectBlue)) {
-        e.preventDefault();
         select("blue");
+        return;
+      }
+      if (key === "Enter") {
+        advanceActiveMatch();
         return;
       }
       const cur = inputRef.current;
       if (!cur.selected) return;
 
       if (key === k.undo) {
-        e.preventDefault();
         cur.undoArmed = !cur.undoArmed;
+        if (cur.undoArmed) {
+          cur.expiresAt = Date.now() + 5000;
+          if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+          timeoutRef.current = window.setTimeout(reset, 5000);
+        }
         setTick((x) => x + 1);
         return;
       }
@@ -134,7 +148,7 @@ export function KeyboardHandler({ suppress }: Props) {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [state, addPoints, setAdvantage, addPenalty, adjustTimer, togglePause, suppress]);
+  }, [state, addPoints, setAdvantage, addPenalty, adjustTimer, togglePause, advanceActiveMatch, suppress]);
 
   // input-state hint banner
   const cur = inputRef.current;

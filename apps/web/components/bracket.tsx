@@ -72,6 +72,24 @@ function StandardBracket({
           </div>
         </div>
       ))}
+      {tree.thirdPlace != null && (
+        <div className="bracket-round">
+          <div className="bracket-round-label">3rd Place</div>
+          <div className="bracket-round-matches">
+            <MatchNode
+              m={tree.thirdPlace}
+              sub={sub}
+              discipline={discipline}
+              ref_={{
+                categoryId: sub.categoryId,
+                subcategoryId: sub.id,
+                discipline,
+                path: { kind: "3rd" },
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -134,6 +152,24 @@ function PlayinBlock({
             </div>
           </div>
         ))}
+        {tree.bracket.thirdPlace != null && (
+          <div className="bracket-round">
+            <div className="bracket-round-label">3rd Place</div>
+            <div className="bracket-round-matches">
+              <MatchNode
+                m={tree.bracket.thirdPlace}
+                sub={sub}
+                discipline={discipline}
+                ref_={{
+                  categoryId: sub.categoryId,
+                  subcategoryId: sub.id,
+                  discipline,
+                  path: { kind: "3rd" },
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

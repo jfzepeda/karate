@@ -22,8 +22,10 @@ import {
   TIMER_OWNER_KEY,
   addParticipant as addParticipantImpl,
   buildInitialState,
+  computeCombatWinner,
   computeWinner,
   finalizeMatchByRef,
+  findNextMatch,
   getMatchByRef,
   getSubcategory,
   loadMatchToScoreboardImpl,
@@ -53,7 +55,8 @@ interface StoreApi {
   resolveJury: (chosenName: string) => void;
   applyTournamentSettings: (
     size: SubcategorySize,
-    mode: DisciplineMode
+    mode: DisciplineMode,
+    pointDiff: number
   ) => boolean;
   replaceParticipants: (list: Omit<Participant, "id">[]) => void;
   addParticipant: (p: Omit<Participant, "id">) => void;
@@ -209,7 +212,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const m = getMatchByRef(s, ref);
           if (!m || m.winner) return;
           s.match.discipline = ref.discipline;
-          const winnerSide = computeWinner(s.match);
+          const threshold = s.tournament.settings.pointDifference;
+          const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
           if (!winnerSide) {
             s.jury = {
               competitors: [s.match.blueName, s.match.redName],
@@ -222,6 +226,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const loserName =
             winnerSide === "blue" ? s.match.redName : s.match.blueName;
           finalizeMatchByRef(s, ref, winnerName, loserName, false);
+          const next = findNextMatch(s, ref);
+          if (next) loadMatchToScoreboardImpl(s, next);
         }),
       resolveJury: (chosenName) =>
         update((s) => {
@@ -230,14 +236,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const other =
             j.competitors[0] === chosenName ? j.competitors[1] : j.competitors[0];
           const ctx = j.context;
+          let searchFromRef: import("@karate/core").ActiveMatchRef | null = null;
           if (ctx.kind === "match") {
+            searchFromRef = ctx.ref;
             finalizeMatchByRef(s, ctx.ref, chosenName, other, true);
           } else if (ctx.kind === "series-final") {
-            const sub = getSubcategory(
-              s,
-              ctx.subRef.categoryId,
-              ctx.subRef.subcategoryId
-            );
+            const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
             if (sub) {
               const tree = sub.trees[ctx.subRef.discipline] as {
                 winner: string | null;
@@ -246,12 +250,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               tree.winner = chosenName;
               tree.juryDecided = true;
             }
+            searchFromRef = { ...ctx.subRef, path: { kind: "series", idx: 1 } };
           } else if (ctx.kind === "rr-final") {
-            const sub = getSubcategory(
-              s,
-              ctx.subRef.categoryId,
-              ctx.subRef.subcategoryId
-            );
+            const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
             if (sub) {
               const tree = sub.trees[ctx.subRef.discipline] as {
                 winner: string | null;
@@ -260,24 +261,34 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               tree.winner = chosenName;
               tree.juryDecided = true;
             }
+            searchFromRef = { ...ctx.subRef, path: { kind: "rr", pair: "bc" } };
           }
           s.jury = null;
+          if (searchFromRef) {
+            const next = findNextMatch(s, searchFromRef);
+            if (next) loadMatchToScoreboardImpl(s, next);
+          }
         }),
-      applyTournamentSettings: (size, mode) => {
+      applyTournamentSettings: (size, mode, pointDiff) => {
         const cur = stateRef.current.tournament.settings;
-        if (cur.subcategorySize === size && cur.disciplineMode === mode)
-          return false;
+        const structureChanged =
+          cur.subcategorySize !== size || cur.disciplineMode !== mode;
+        if (!structureChanged && cur.pointDifference === pointDiff) return false;
         const ok =
-          typeof window !== "undefined"
+          !structureChanged ||
+          (typeof window !== "undefined"
             ? window.confirm("This will reset all bracket progress. Continue?")
-            : true;
+            : true);
         if (!ok) return false;
         update((s) => {
-          s.tournament.settings.subcategorySize = size;
-          s.tournament.settings.disciplineMode = mode;
-          rebuildAllSubcategories(s);
-          resetLiveScoreboard(s);
-          s.jury = null;
+          s.tournament.settings.pointDifference = pointDiff;
+          if (structureChanged) {
+            s.tournament.settings.subcategorySize = size;
+            s.tournament.settings.disciplineMode = mode;
+            rebuildAllSubcategories(s);
+            resetLiveScoreboard(s);
+            s.jury = null;
+          }
         });
         return true;
       },
@@ -314,7 +325,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const ref = s.match.activeMatchRef;
           if (ref) {
             s.match.discipline = ref.discipline;
-            const winnerSide = computeWinner(s.match);
+            const threshold = s.tournament.settings.pointDifference;
+            const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
             if (!winnerSide) {
               s.jury = {
                 competitors: [s.match.blueName, s.match.redName],
@@ -327,6 +339,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             const loserName =
               winnerSide === "blue" ? s.match.redName : s.match.blueName;
             finalizeMatchByRef(s, ref, winnerName, loserName, false);
+            const next = findNextMatch(s, ref);
+            if (next) loadMatchToScoreboardImpl(s, next);
           }
         });
       },
@@ -335,6 +349,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           if (side === "blue")
             s.match.bluePoints = Math.max(0, s.match.bluePoints + n);
           else s.match.redPoints = Math.max(0, s.match.redPoints + n);
+          // Real-time point-difference win condition (combat only)
+          const ref = s.match.activeMatchRef;
+          const threshold = s.tournament.settings.pointDifference;
+          if (ref && s.match.discipline === "combat" && threshold > 0) {
+            const winnerSide = computeCombatWinner(s.match, threshold);
+            if (winnerSide) {
+              s.timer.running = false;
+              const winnerName =
+                winnerSide === "blue" ? s.match.blueName : s.match.redName;
+              const loserName =
+                winnerSide === "blue" ? s.match.redName : s.match.blueName;
+              finalizeMatchByRef(s, ref, winnerName, loserName, false);
+              const next = findNextMatch(s, ref);
+              if (next) loadMatchToScoreboardImpl(s, next);
+            }
+          }
         }),
       setAdvantage: (side, value) =>
         update((s) => {

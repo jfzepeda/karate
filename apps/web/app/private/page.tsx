@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { describeRefLabel, getMatchByRef } from "@karate/core";
+import { allMatchesComplete, describeRefLabel, getMatchByRef } from "@karate/core";
 import { useStore } from "@/lib/store";
 import { Scoreboard } from "@/components/scoreboard";
 import { KeyboardHandler } from "@/components/keyboard-handler";
@@ -18,12 +18,15 @@ export default function PrivatePage() {
 
   const ref = state.match.activeMatchRef;
   const m = ref ? getMatchByRef(state, ref) : null;
-  const advLabel = ref
+  const done = !ref && allMatchesComplete(state);
+  const advLabel = done
+    ? "🏆 Torneo completo — no hay más encuentros"
+    : ref
     ? m && m.winner
       ? `Advanced · ${describeRefLabel(state, ref)}`
       : `Advance · ${describeRefLabel(state, ref)}`
     : "Advance · no match loaded";
-  const advDisabled = !ref || !m || !!m.winner;
+  const advDisabled = done || !ref || !m || !!m.winner;
 
   return (
     <section id="view-private" style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 44px)" }}>
