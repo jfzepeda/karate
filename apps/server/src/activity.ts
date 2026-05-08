@@ -12,7 +12,12 @@ export type ActivityAction =
   | "user_delete"
   | "data_update"
   | "logo_upload"
-  | "logo_remove";
+  | "logo_remove"
+  | "session_revoke"
+  | "session_revoke_all"
+  | "generate_launch"
+  | "prepare_download"
+  | "access_extend";
 
 export interface ActivityEntry {
   ts: number;

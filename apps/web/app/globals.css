@@ -843,6 +843,43 @@ body.is-public.fs-active .fs-hint { opacity: 0; }
   font-size: 11px;
 }
 
+.auth-downloads {
+  margin-top: 16px;
+  text-align: center;
+}
+
+.auth-downloads p {
+  margin: 0 0 10px;
+}
+
+.auth-downloads-row {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: var(--panel-2, #1d2230);
+  border: 1px solid var(--border, #2a3142);
+  color: var(--fg, #e2e8f0);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.download-btn:hover {
+  background: var(--panel-3, #252d3d);
+  border-color: var(--accent, #6366f1);
+  color: #fff;
+}
+
 /* topbar additions */
 .topbar-link {
   background: transparent;
@@ -861,6 +898,14 @@ body.is-public.fs-active .fs-hint { opacity: 0; }
   font-size: 12px;
   color: var(--muted, #8a93a6);
   padding: 0 6px;
+}
+.topbar-download {
+  color: var(--accent, #6366f1) !important;
+  border-color: var(--accent, #6366f1) !important;
+  font-size: 12px;
+}
+.topbar-download:hover {
+  background: rgba(99,102,241,0.1) !important;
 }
 
 /* ============ area select ============ */

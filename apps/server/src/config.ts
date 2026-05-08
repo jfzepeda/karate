@@ -1,19 +1,21 @@
 import * as path from "path";
 import * as os from "os";
 
+export interface LaunchConfig {
+  issuedAt: number;
+  expiresAt: number;
+  sessionTtlSeconds?: number;
+  role: "superadmin" | "referee";
+  data: Record<string, unknown>;
+}
+
 export interface ServerConfig {
   dataDir: string;
   port: number;
-  tokenTtlSeconds: number;
-  renewalThresholdSeconds: number;
   superadminBootstrap: { username: string; password: string };
   refereeBootstrap: { username: string; password: string }[];
-  /**
-   * Optional path to a directory of static files (e.g., a Next.js `out/` build).
-   * When set, the server mounts it at "/" with proper SPA-style fallback so the
-   * web app can be served from the same origin as the API.
-   */
   staticDir?: string | null;
+  launchConfig?: LaunchConfig | null;
 }
 
 export function defaultDataDir(): string {
@@ -25,8 +27,6 @@ export function defaultConfig(overrides: Partial<ServerConfig> = {}): ServerConf
   return {
     dataDir: overrides.dataDir ?? defaultDataDir(),
     port: overrides.port ?? Number(process.env.KARATE_PORT ?? 47291),
-    tokenTtlSeconds: overrides.tokenTtlSeconds ?? 24 * 60 * 60,
-    renewalThresholdSeconds: overrides.renewalThresholdSeconds ?? 20 * 60 * 60,
     superadminBootstrap: overrides.superadminBootstrap ?? {
       username: "superadmin",
       password: "KarateAdmin2024!",
@@ -49,4 +49,5 @@ export const PATHS = {
   activity: "activity.log",
   uploads: "uploads",
   logo: "uploads/logo",
+  downloads: "downloads",
 };

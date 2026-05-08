@@ -1,13 +1,40 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
+import { isElectron, apiGetDownloadInfo, apiPrepareDownload, getServerUrl, type DownloadInfo } from "@/lib/api-client";
 
 export function TopTabs() {
   const pathname = usePathname() || "/";
   const router = useRouter();
-  const { status, user, logout } = useAuth();
+  const { status, user, logout, isKiosk } = useAuth();
+  const [downloads, setDownloads] = useState<DownloadInfo | null>(null);
+  const [downloading, setDownloading] = useState(false);
+
+  useEffect(() => {
+    if (isElectron() || status.kind !== "authed") return;
+    apiGetDownloadInfo().then(setDownloads).catch(() => {});
+  }, [status.kind]);
+
+  async function handleDownloadApp() {
+    if (!downloads?.mac || status.kind !== "authed") return;
+    setDownloading(true);
+    try {
+      const { tokenId } = await apiPrepareDownload(status.session.token);
+      const link = document.createElement("a");
+      link.href = `${getServerUrl()}/api/download-app/${tokenId}`;
+      link.download = "KarateTournament.dmg";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch {
+      alert("Error preparing download. Try again.");
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   // The public scoreboard view is chromeless.
   if (pathname.startsWith("/public")) return null;
@@ -59,7 +86,7 @@ export function TopTabs() {
       })}
       <span className="brand">KARATE TOURNAMENT</span>
       <span style={{ marginLeft: "auto", display: "inline-flex", gap: 8, alignItems: "center" }}>
-        {role === "referee" ? (
+        {role === "referee" && !isKiosk ? (
           <button
             type="button"
             className="topbar-link"
@@ -69,10 +96,22 @@ export function TopTabs() {
             ← Change Area
           </button>
         ) : null}
-        <span className="topbar-user">{user?.username}</span>
-        <button type="button" className="topbar-link" onClick={logout}>
-          Sign out
-        </button>
+        {!isElectron() && downloads?.mac && (
+          <button
+            type="button"
+            className="topbar-link topbar-download"
+            onClick={handleDownloadApp}
+            disabled={downloading}
+            title="Download the desktop app with your current session"
+          >
+            {downloading ? "Preparing…" : "↓ Download App"}
+          </button>
+        )}
+        {!isKiosk && (
+          <button type="button" className="topbar-link" onClick={logout}>
+            Sign out
+          </button>
+        )}
       </span>
     </nav>
   );

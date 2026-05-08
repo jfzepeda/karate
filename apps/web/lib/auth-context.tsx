@@ -1,19 +1,5 @@
 "use client";
 
-/**
- * Auth context for the karate web app.
- *
- * Lifecycle:
- *   1. On mount, load the cached session (token + expiry + user) from localStorage.
- *   2. If a token is present and not yet expired, mark the user signed-in immediately.
- *   3. In the background, attempt a renewal whenever the token age exceeds the
- *      renewal threshold (20h by default). Success → swap in the new token.
- *      Failure due to network → keep using the cached token until it expires.
- *      Failure due to revocation/expired account → log out.
- *   4. If the cached token is expired and the server is unreachable, surface a
- *      "lock" state so the UI can show the renewal screen instead of the app.
- */
-
 import {
   createContext,
   useCallback,
@@ -24,14 +10,12 @@ import {
   useState,
 } from "react";
 import type { AuthSession, AuthUser, Role } from "@karate/core";
-import { ApiError, apiLogin, apiMe, apiRenew } from "./api-client";
+import { apiLogin, apiMe } from "./api-client";
 
 const STORAGE_TOKEN = "karate.auth.token";
 const STORAGE_EXPIRY = "karate.auth.expiresAt";
+const STORAGE_ISSUED_AT = "karate.auth.issuedAt";
 const STORAGE_USER = "karate.auth.user";
-const STORAGE_USERNAME = "karate.auth.username";
-const STORAGE_PASSWORD = "karate.auth.password"; // see SECURITY note at bottom of file
-const STORAGE_PUBLIC_KEY = "karate.auth.publicKey";
 
 export type AuthStatus =
   | { kind: "loading" }
@@ -43,15 +27,14 @@ interface AuthApi {
   status: AuthStatus;
   user: AuthUser | null;
   token: string | null;
-  login(username: string, password: string): Promise<AuthUser>;
+  isKiosk: boolean;
+  login(code: string): Promise<AuthUser>;
   logout(): void;
-  retryRenewal(): Promise<void>;
+  redeemCode(code: string): Promise<void>;
   hasRole(role: Role | Role[]): boolean;
 }
 
 const AuthContext = createContext<AuthApi | null>(null);
-
-const RENEWAL_THRESHOLD_SECONDS = 20 * 60 * 60;
 
 function readNumber(key: string): number | null {
   if (typeof window === "undefined") return null;
@@ -76,20 +59,12 @@ function readUser(): AuthUser | null {
   }
 }
 
-function persistSession(session: AuthSession & { publicKey?: string }): void {
+function persistSession(session: AuthSession): void {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(STORAGE_TOKEN, session.token);
   window.localStorage.setItem(STORAGE_EXPIRY, String(session.expiresAt));
+  window.localStorage.setItem(STORAGE_ISSUED_AT, String(session.issuedAt ?? Date.now()));
   window.localStorage.setItem(STORAGE_USER, JSON.stringify(session.user));
-  if (session.publicKey) {
-    window.localStorage.setItem(STORAGE_PUBLIC_KEY, session.publicKey);
-  }
-}
-
-function persistCredentials(username: string, password: string): void {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(STORAGE_USERNAME, username);
-  window.localStorage.setItem(STORAGE_PASSWORD, password);
 }
 
 function clearAll(): void {
@@ -97,106 +72,90 @@ function clearAll(): void {
   for (const k of [
     STORAGE_TOKEN,
     STORAGE_EXPIRY,
+    STORAGE_ISSUED_AT,
     STORAGE_USER,
-    STORAGE_USERNAME,
-    STORAGE_PASSWORD,
   ]) {
     window.localStorage.removeItem(k);
   }
 }
 
+// Suppress unused import warning — apiMe is kept for potential use
+void apiMe;
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>({ kind: "loading" });
-  const renewing = useRef(false);
+  const isKiosk = useRef(false);
 
   const setAuthed = useCallback((session: AuthSession) => {
     setStatus({ kind: "authed", session });
   }, []);
 
-  const handleAuthError = useCallback((reason: string) => {
-    clearAll();
-    setStatus({ kind: "locked", reason });
-  }, []);
-
-  const tryRenew = useCallback(async (): Promise<void> => {
-    if (renewing.current) return;
-    renewing.current = true;
-    try {
-      const username = readString(STORAGE_USERNAME);
-      const password = readString(STORAGE_PASSWORD);
-      if (!username || !password) {
-        clearAll();
-        setStatus({ kind: "anonymous" });
-        return;
-      }
-      const session = await apiRenew(username, password);
-      persistSession(session);
-      setAuthed(session);
-    } catch (e) {
-      const err = e as ApiError;
-      if (err && err.status === 401) {
-        // Permanent rejection — account revoked or password changed.
-        clearAll();
-        setStatus({ kind: "locked", reason: err.code || "account_revoked" });
-        return;
-      }
-      // Network failure — fall back to whatever we have cached.
-      const expiresAt = readNumber(STORAGE_EXPIRY);
-      const user = readUser();
-      const token = readString(STORAGE_TOKEN);
-      if (token && user && expiresAt && expiresAt > Date.now()) {
-        setAuthed({ token, expiresAt, user });
-      } else {
-        setStatus({ kind: "locked", reason: "offline" });
-      }
-    } finally {
-      renewing.current = false;
-    }
-  }, [setAuthed]);
-
-  // Bootstrap on mount.
+  // Bootstrap on mount — fully synchronous, no network calls needed.
   useEffect(() => {
+    const now = Date.now();
+
+    // In Electron the kiosk session is injected by the preload (from main process)
+    // so it's available synchronously with no fetch required.
+    const kiosk = window.__KARATE__?.kioskSession ?? null;
+    if (kiosk) {
+      if (kiosk.expiresAt > now) {
+        isKiosk.current = true;
+        setAuthed({
+          token: kiosk.token,
+          issuedAt: kiosk.issuedAt,
+          expiresAt: kiosk.expiresAt,
+          user: { role: kiosk.user.role as import("@karate/core").Role },
+        });
+        return;
+      }
+      // Kiosk token already expired when the app opened.
+      setStatus({ kind: "locked", reason: "kiosk_expired" });
+      return;
+    }
+
+    // Normal browser / web flow — check localStorage.
     const token = readString(STORAGE_TOKEN);
     const expiresAt = readNumber(STORAGE_EXPIRY);
     const user = readUser();
-    const now = Date.now();
 
-    if (!token || !expiresAt || !user) {
+    if (!token || expiresAt === null || !user) {
       setStatus({ kind: "anonymous" });
       return;
     }
-    if (expiresAt <= now) {
-      // Cached token has fully expired; attempt a fresh renewal.
-      void tryRenew();
+    // expiresAt === 0 means superadmin (never expires)
+    if (expiresAt !== 0 && expiresAt <= now) {
+      clearAll();
+      setStatus({ kind: user.role === "superadmin" ? "anonymous" : "locked", reason: "session_expired" });
       return;
     }
-    // Token is still valid. Mark authed immediately.
-    setAuthed({ token, expiresAt, user });
-    // If we're past the renewal threshold, refresh in the background.
-    const ageSeconds = Math.floor((now - (expiresAt - 24 * 60 * 60 * 1000)) / 1000);
-    if (ageSeconds > RENEWAL_THRESHOLD_SECONDS) {
-      void tryRenew();
-    }
-  }, [tryRenew, setAuthed]);
+    setAuthed({ token, issuedAt: readNumber(STORAGE_ISSUED_AT) ?? now, expiresAt, user });
+  }, [setAuthed]);
 
   // Watch for the access token expiring while the app is open.
   useEffect(() => {
     if (status.kind !== "authed") return;
-    const msUntilExpiry = status.session.expiresAt - Date.now();
+    const { expiresAt } = status.session;
+    if (expiresAt === 0) return; // superadmin — never expires
+    const msUntilExpiry = expiresAt - Date.now();
     if (msUntilExpiry <= 0) {
-      void tryRenew();
+      clearAll();
+      setStatus({ kind: isKiosk.current ? "locked" : "locked", reason: isKiosk.current ? "kiosk_expired" : "session_expired" });
       return;
     }
-    const renewIn = Math.max(60_000, msUntilExpiry - 5 * 60 * 1000);
-    const t = window.setTimeout(() => void tryRenew(), renewIn);
+    const role = status.session.user.role;
+    const t = window.setTimeout(() => {
+      clearAll();
+      if (isKiosk.current) setStatus({ kind: "locked", reason: "kiosk_expired" });
+      else if (role === "superadmin") setStatus({ kind: "anonymous" });
+      else setStatus({ kind: "locked", reason: "session_expired" });
+    }, msUntilExpiry);
     return () => window.clearTimeout(t);
-  }, [status, tryRenew]);
+  }, [status]);
 
   const login = useCallback(
-    async (username: string, password: string): Promise<AuthUser> => {
-      const session = await apiLogin(username, password);
+    async (code: string): Promise<AuthUser> => {
+      const session = await apiLogin(code);
       persistSession(session);
-      persistCredentials(username, password);
       setAuthed(session);
       return session.user;
     },
@@ -208,22 +167,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setStatus({ kind: "anonymous" });
   }, []);
 
+  const redeemCode = useCallback(async (code: string): Promise<void> => {
+    await login(code);
+  }, [login]);
+
   const api: AuthApi = useMemo(() => {
     const session = status.kind === "authed" ? status.session : null;
     return {
       status,
       user: session ? session.user : null,
       token: session ? session.token : null,
+      isKiosk: isKiosk.current,
       login,
       logout,
-      retryRenewal: tryRenew,
+      redeemCode,
       hasRole(role) {
         if (!session) return false;
         const roles = Array.isArray(role) ? role : [role];
         return roles.includes(session.user.role);
       },
     };
-  }, [status, login, logout, tryRenew]);
+  }, [status, login, logout, redeemCode]);
 
   return <AuthContext.Provider value={api}>{children}</AuthContext.Provider>;
 }
@@ -233,9 +197,3 @@ export function useAuth(): AuthApi {
   if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
   return ctx;
 }
-
-// SECURITY note: storing the cleartext password in localStorage is a deliberate
-// trade-off chosen to satisfy the "send credentials on renew" spec while keeping
-// the desktop app fully offline-capable. In Electron we plan to migrate this to
-// Electron's `safeStorage` API (OS-encrypted) — see apps/desktop/preload.ts.
-// Until then, the app should only be installed on machines the operator trusts.

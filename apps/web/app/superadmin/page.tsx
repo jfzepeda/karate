@@ -6,6 +6,7 @@ import { CompetitorsSection } from "@/components/superadmin/competitors-section"
 import { SeedingSection } from "@/components/superadmin/seeding-section";
 import { SetupSection } from "@/components/superadmin/setup-section";
 import { LogoSection } from "@/components/superadmin/logo-section";
+import { UsersSection } from "@/components/superadmin/users-section";
 
 export default function SuperadminPage() {
   const { state, loadMockTournament } = useStore();
@@ -39,6 +40,7 @@ export default function SuperadminPage() {
         </div>
       )}
 
+      <UsersSection />
       <CategoriesSection />
       <CompetitorsSection />
       <SeedingSection />
