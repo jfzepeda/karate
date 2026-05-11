@@ -10,8 +10,7 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
-function readServerUrlFromArgv() {
-  const flag = "--karate-server-url=";
+function readArgFromArgv(flag) {
   for (const arg of process.argv) {
     if (typeof arg === "string" && arg.startsWith(flag)) {
       return arg.slice(flag.length);
@@ -20,11 +19,20 @@ function readServerUrlFromArgv() {
   return null;
 }
 
-const serverUrl = readServerUrlFromArgv();
+const serverUrl = readArgFromArgv("--karate-server-url=");
+
+// Use synchronous IPC to get the kiosk session from the main process.
+// This is guaranteed to have the correct value since main sets it before
+// creating any windows.
+let kioskSession = null;
+try {
+  kioskSession = ipcRenderer.sendSync("karate:get-kiosk-session");
+} catch { /* ignore */ }
 
 contextBridge.exposeInMainWorld("__KARATE__", {
   isElectron: true,
   serverUrl,
+  kioskSession,
   openPublicWindow() {
     ipcRenderer.invoke("karate:open-public-window");
   },

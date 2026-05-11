@@ -1,6 +1,6 @@
 "use client";
 
-import type { AuthSession, AuthUser } from "@karate/core";
+import type { AuthSession, AuthUser, SessionInfo, KioskSession } from "@karate/core";
 
 /**
  * Resolve the backend base URL.
@@ -13,6 +13,7 @@ declare global {
     __KARATE__?: {
       serverUrl?: string;
       isElectron?: boolean;
+      kioskSession?: { token: string; issuedAt: number; expiresAt: number; user: { role: string } } | null;
     };
   }
 }
@@ -98,24 +99,71 @@ export async function apiRequest<T>(path: string, opts: RequestOptions = {}): Pr
 }
 
 // ---------- Auth endpoints ----------
-export async function apiLogin(username: string, password: string): Promise<
-  AuthSession & { publicKey: string }
-> {
+export async function apiLogin(code: string): Promise<AuthSession> {
   return apiRequest("/api/login", {
     method: "POST",
-    body: { username, password },
-  });
-}
-
-export async function apiRenew(username: string, password: string): Promise<AuthSession> {
-  return apiRequest("/api/renew-token", {
-    method: "POST",
-    body: { username, password },
+    body: { code },
   });
 }
 
 export async function apiMe(token: string): Promise<{ user: AuthUser }> {
   return apiRequest("/api/me", { token });
+}
+
+// ---------- Kiosk ----------
+export async function apiGetKioskSession(signal?: AbortSignal): Promise<KioskSession> {
+  return apiRequest<KioskSession>("/api/kiosk-session", { signal });
+}
+
+export interface LaunchConfig {
+  issuedAt: number;
+  expiresAt: number;
+  role: string;
+  data: Record<string, unknown>;
+}
+
+export async function apiGenerateLaunch(token: string): Promise<LaunchConfig> {
+  return apiRequest<LaunchConfig>("/api/generate-launch", { token, method: "POST" });
+}
+
+export async function apiPrepareDownload(token: string): Promise<{ tokenId: string }> {
+  return apiRequest("/api/prepare-download", { token, method: "POST" });
+}
+
+// ---------- Downloads ----------
+export interface DownloadInfo {
+  mac: string | null;
+  win: string | null;
+}
+
+export async function apiGetDownloadInfo(): Promise<DownloadInfo> {
+  return apiRequest("/api/download-info");
+}
+
+export function downloadUrl(filename: string): string {
+  return getServerUrl().replace(/\/+$/, "") + `/api/downloads/${encodeURIComponent(filename)}`;
+}
+
+// ---------- Session management (superadmin) ----------
+export async function apiGetSessions(token: string): Promise<{ sessions: SessionInfo[] }> {
+  return apiRequest("/api/sessions", { token });
+}
+
+export async function apiRevokeSession(token: string, jti: string): Promise<{ ok: true }> {
+  return apiRequest(`/api/sessions/${encodeURIComponent(jti)}`, { token, method: "DELETE" });
+}
+
+// ---------- Referee code generation (superadmin) ----------
+export async function apiGenerateRefereeCode(token: string): Promise<{ code: string }> {
+  return apiRequest("/api/referee-code", { token, method: "POST" });
+}
+
+export async function apiGetRefereeCodes(token: string): Promise<{ codes: { code: string; expiresAt: number }[] }> {
+  return apiRequest("/api/referee-codes", { token });
+}
+
+export async function apiDeleteRefereeCode(token: string, code: string): Promise<{ ok: true }> {
+  return apiRequest(`/api/referee-codes/${encodeURIComponent(code)}`, { token, method: "DELETE" });
 }
 
 // ---------- Tournament data ----------
@@ -167,3 +215,15 @@ export async function apiRemoveLogo(token: string): Promise<{ ok: true }> {
 export function logoSrc(): string {
   return getServerUrl().replace(/\/+$/, "") + "/api/logo";
 }
+
+// ---------- App config (superadmin) ----------
+export async function apiGetAppConfig(token: string): Promise<{ sessionTtlMinutes: number }> {
+  return apiRequest("/api/app-config", { token });
+}
+
+export async function apiUpdateAppConfig(token: string, sessionTtlMinutes: number): Promise<{ sessionTtlMinutes: number }> {
+  return apiRequest("/api/app-config", { token, method: "PUT", body: { sessionTtlMinutes } });
+}
+
+// Re-export SessionInfo for consumers
+export type { SessionInfo };

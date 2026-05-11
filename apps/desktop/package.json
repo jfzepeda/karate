@@ -5,7 +5,7 @@
   "main": "main.js",
   "description": "Karate Tournament desktop wrapper (Electron + bundled server + Next.js export)",
   "scripts": {
-    "build:server": "pnpm --filter @karate/server build",
+    "build:server": "esbuild ../server/src/index.ts --bundle --platform=node --target=node18 --outfile=dist-server/index.js",
     "build:web": "cross-env KARATE_EXPORT=1 pnpm --filter @karate/web build",
     "prepackage": "pnpm build:server && pnpm build:web",
     "dev": "electron .",
@@ -21,6 +21,7 @@
   "devDependencies": {
     "cross-env": "^7.0.3",
     "electron": "^33.0.2",
+    "esbuild": "^0.25.0",
     "electron-builder": "^25.1.8"
   },
   "build": {
@@ -44,7 +45,7 @@
         "filter": ["**/*"]
       },
       {
-        "from": "../server/dist",
+        "from": "dist-server",
         "to": "server",
         "filter": ["**/*"]
       }

@@ -15,6 +15,8 @@
 
 const { app, BrowserWindow, ipcMain, screen } = require("electron");
 const path = require("path");
+const os = require("os");
+const fs = require("fs");
 
 const isPackaged = app.isPackaged;
 const ROOT = __dirname;
@@ -43,12 +45,42 @@ let publicWindow = null;
 let serverHandle = null;
 let serverUrl = null;
 
+function readLaunchConfig() {
+  // process.resourcesPath = <App>.app/Contents/Resources — three levels up is the DMG root
+  // or the folder the user placed the app in.
+  const appParentDir = path.dirname(path.dirname(path.dirname(process.resourcesPath)));
+  const candidates = isPackaged
+    ? [
+        path.join(appParentDir, "karate-launch.json"),          // next to the .app (DMG root)
+        path.join(process.resourcesPath, "karate-launch.json"), // legacy: injected inside bundle
+      ]
+    : [
+        path.join(os.homedir(), "Downloads", "karate-launch.json"),
+        path.join(__dirname, "karate-launch.json"),
+      ];
+
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (!cfg || typeof cfg.expiresAt !== "number") continue;
+      if (cfg.expiresAt <= Date.now()) continue;
+      return cfg;
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+let kioskSession = null;
+
 async function startServer() {
   const { createServer } = resolveServerModule();
   const staticDir = resolveStaticDir();
-  serverHandle = await createServer({ staticDir, port: 0 });
+  const launchConfig = readLaunchConfig();
+  serverHandle = await createServer({ staticDir, port: 0, launchConfig });
   const { url, port } = await serverHandle.start();
   serverUrl = url;
+  kioskSession = serverHandle.kioskSession ?? null;
   // eslint-disable-next-line no-console
   console.log(`[karate-desktop] server listening on ${url} (port ${port})`);
 }
@@ -59,7 +91,9 @@ function commonWebPreferences() {
     contextIsolation: true,
     nodeIntegration: false,
     sandbox: false,
-    additionalArguments: [`--karate-server-url=${serverUrl}`],
+    additionalArguments: [
+      `--karate-server-url=${serverUrl}`,
+    ],
   };
 }
 
@@ -116,6 +150,9 @@ app.whenReady().then(async () => {
   }
 
   ipcMain.handle("karate:get-server-url", () => serverUrl);
+  ipcMain.on("karate:get-kiosk-session", (event) => {
+    event.returnValue = kioskSession;
+  });
   ipcMain.handle("karate:open-public-window", () => {
     createPublicWindow();
     return true;
