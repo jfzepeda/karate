@@ -3,28 +3,34 @@
 /**
  * AuthGate sits between the layout's providers and the page content. It:
  *
- *   - Shows the login screen when the user is unauthenticated.
- *   - Shows the lock screen when a token is expired and renewal failed.
- *   - Optionally enforces role gating (e.g., superadmin-only routes).
- *   - For the public scoreboard route, allows anonymous access (the audience
- *     screen does not require login — it just mirrors live state from the
- *     authed admin/private windows over BroadcastChannel).
+ *   - Shows the activation screen in UNLICENSED state.
+ *   - Shows the lock screen in DEGRADED state with the specific reason.
+ *   - Renders content + non-dismissable grace banner in GRACE state.
+ *   - Enforces optional role gating for ACTIVE state.
+ *   - For the public scoreboard route: in ACTIVE / GRACE it allows anonymous
+ *     access; in DEGRADED / UNLICENSED the public window is fully hidden
+ *     (no scoreboard, no competitor data, per Part 11 of the spec).
  */
 
-import type { Role } from "@karate/core";
+import type { LicenseDegradedReason, Role } from "@karate/core";
 import { useAuth } from "@/lib/auth-context";
 import { LoginScreen } from "./login-screen";
 import { LockScreen } from "./lock-screen";
+import { GraceBanner } from "./grace-banner";
 
 interface Props {
   children: React.ReactNode;
   /** When provided, page is gated to these roles only. */
   roles?: Role[];
-  /** When true, renders children even if unauthenticated (used by /public). */
+  /** When true, renders children without a license requirement (audience-only
+   *  views). Only honored in ACTIVE / GRACE — never in DEGRADED. */
   allowAnonymous?: boolean;
+  /** When true, this route IS the public scoreboard and must be hidden when
+   *  the license is degraded or absent. */
+  isPublicView?: boolean;
 }
 
-export function AuthGate({ children, roles, allowAnonymous }: Props) {
+export function AuthGate({ children, roles, allowAnonymous, isPublicView }: Props) {
   const { status, hasRole } = useAuth();
 
   if (status.kind === "loading") {
@@ -36,13 +42,32 @@ export function AuthGate({ children, roles, allowAnonymous }: Props) {
   }
 
   if (status.kind === "anonymous") {
+    if (isPublicView) {
+      return (
+        <div className="auth-screen">
+          <div className="auth-card auth-locked">
+            <h1>Display Unavailable</h1>
+            <p>The scoreboard is offline.</p>
+          </div>
+        </div>
+      );
+    }
     if (allowAnonymous) return <>{children}</>;
     return <LoginScreen />;
   }
 
   if (status.kind === "locked") {
-    if (allowAnonymous) return <>{children}</>;
-    return <LockScreen reason={status.reason} />;
+    if (isPublicView) {
+      return (
+        <div className="auth-screen">
+          <div className="auth-card auth-locked">
+            <h1>Display Unavailable</h1>
+            <p>The scoreboard is offline.</p>
+          </div>
+        </div>
+      );
+    }
+    return <LockScreen reason={status.reason as LicenseDegradedReason} />;
   }
 
   if (roles && !hasRole(roles)) {
@@ -56,5 +81,10 @@ export function AuthGate({ children, roles, allowAnonymous }: Props) {
     );
   }
 
-  return <>{children}</>;
+  return (
+    <>
+      <GraceBanner />
+      {children}
+    </>
+  );
 }

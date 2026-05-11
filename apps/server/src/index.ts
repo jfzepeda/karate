@@ -6,10 +6,9 @@ import { type ServerConfig, defaultConfig } from "./config";
 import { ensureDir } from "./storage";
 import { loadOrCreateKeys, type KeyPair } from "./keys";
 import { buildRoutes } from "./routes";
-import { SessionStore } from "./session-store";
-import { signToken } from "./auth";
+import { LicenseStore } from "./licenses";
+import { signLicenseToken } from "./auth";
 import { saveData } from "./data-store";
-import { loadAppConfig } from "./app-config";
 import type { KioskSession, Role } from "@karate/core";
 
 export interface KarateServer {
@@ -17,6 +16,8 @@ export interface KarateServer {
   config: ServerConfig;
   keys: KeyPair;
   kioskSession: KioskSession | null;
+  licenses: LicenseStore;
+  publicKeySpki: string;
   start(): Promise<{ port: number; url: string }>;
   stop(): Promise<void>;
 }
@@ -27,27 +28,48 @@ export async function createServer(
   const config = defaultConfig(overrides);
   ensureDir(config.dataDir);
   ensureDir(path.join(config.dataDir, "uploads"));
-  const keys = loadOrCreateKeys(config.dataDir);
+  const keys = await loadOrCreateKeys(config.dataDir);
+  const licenses = new LicenseStore(config.dataDir);
 
-  const sessionStore = new SessionStore();
+  // Seed test claim codes the first time the server boots. After seeding the
+  // codes are idempotent — `seedCode` is a no-op on re-runs because each code
+  // hash already exists in the store.
+  for (const seed of config.seedClaimCodes) {
+    licenses.seedCode(seed.code, {
+      role: seed.role,
+      features: seed.features,
+      label: seed.label,
+    });
+  }
 
   let kioskSession: KioskSession | null = null;
   if (config.launchConfig) {
     const lc = config.launchConfig;
     if (lc.expiresAt > Date.now()) {
       saveData(config.dataDir, lc.data);
-      // Use the explicit sessionTtlSeconds from the launch config if present,
-      // otherwise fall back to the app-config TTL.
-      const ttlSeconds = lc.sessionTtlSeconds ?? loadAppConfig(config.dataDir).sessionTtlMinutes * 60;
-      const { token, issuedAt, expiresAt, jti } = signToken(
-        { config, keys, sessions: sessionStore },
-        lc.role as Role,
-        ttlSeconds,
+      const role = lc.role as Role;
+      const features = role === "superadmin"
+        ? ["scoring", "public_display", "bracket_view", "tournament_config",
+            "logo_upload", "user_management", "activity_log"] as const
+        : ["scoring", "public_display", "bracket_view"] as const;
+      const userId = "kiosk_" + Math.random().toString(36).slice(2, 10);
+      const { token, payload } = await signLicenseToken(
+        { config, keys, licenses },
+        {
+          userId,
+          role,
+          features: [...features],
+          plan: role,
+          machineFingerprint: "kiosk-no-fp",
+          activatedAt: Math.floor(Date.now() / 1000),
+          ttlSeconds: Math.floor((lc.expiresAt - Date.now()) / 1000),
+        }
       );
-      sessionStore.add({ jti, role: lc.role as Role, issuedAt, expiresAt, ip: null, revoked: false });
       kioskSession = {
-        token, issuedAt, expiresAt,
-        user: { role: lc.role as Role },
+        token,
+        issuedAt: payload.iat * 1000,
+        expiresAt: payload.exp * 1000,
+        user: { role, features: [...features] },
       };
     }
   }
@@ -56,15 +78,11 @@ export async function createServer(
   app.disable("x-powered-by");
   app.use(cors());
   app.use(express.json({ limit: "5mb" }));
-  app.use(buildRoutes(config, keys, sessionStore, kioskSession));
+  app.use(buildRoutes(config, keys, licenses, kioskSession));
 
   if (config.staticDir && fs.existsSync(config.staticDir)) {
     const staticDir = config.staticDir;
-    // Serve static assets directly. `extensions: ["html"]` means /admin → admin.html.
     app.use(express.static(staticDir, { extensions: ["html"], index: "index.html" }));
-    // SPA-ish fallback: for any non-API route that didn't match a file,
-    // try `<route>/index.html` (Next.js export uses this for nested routes),
-    // then fall back to root `index.html`.
     app.use((req: Request, res: Response, next: NextFunction) => {
       if (req.method !== "GET") return next();
       if (req.path.startsWith("/api/") || req.path.startsWith("/admin-panel")) {
@@ -91,6 +109,8 @@ export async function createServer(
     config,
     keys,
     kioskSession,
+    licenses,
+    publicKeySpki: keys.publicKeySpki,
     start() {
       return new Promise((resolve) => {
         server = app.listen(config.port, () => {

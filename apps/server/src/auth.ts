@@ -1,61 +1,110 @@
-import * as jwt from "jsonwebtoken";
+import { SignJWT, jwtVerify } from "jose";
 import * as crypto from "crypto";
 import type { Request, Response, NextFunction } from "express";
-import type { Role } from "@karate/core";
+import type { Role, Feature } from "@karate/core";
 import type { ServerConfig } from "./config";
 import type { KeyPair } from "./keys";
-import type { SessionStore } from "./session-store";
+import { ALG, KID } from "./keys";
+import type { LicenseStore } from "./licenses";
 
-export interface TokenPayload {
+export const ISSUER = "https://api.karate-tournament.app";
+export const AUDIENCE = "karate-tournament-app";
+export const JWT_TTL_SECONDS = 24 * 60 * 60;
+
+export interface LicensePayload {
+  sub: string;            // userId
+  iss: string;
+  aud: string;
+  iat: number;
+  nbf: number;
+  exp: number;
   jti: string;
+  machine_fp: string;
+  plan: string;
+  features: Feature[];
+  activated_at: number;
   role: Role;
-  iat?: number;
-  exp?: number;
 }
 
 export interface AuthDeps {
   config: ServerConfig;
   keys: KeyPair;
-  sessions: SessionStore;
+  licenses: LicenseStore;
 }
 
-export function signToken(
+export interface SignTokenOptions {
+  userId: string;
+  role: Role;
+  features: Feature[];
+  plan: string;
+  machineFingerprint: string;
+  activatedAt: number;
+  ttlSeconds?: number;
+}
+
+export async function signLicenseToken(
   deps: AuthDeps,
-  role: Role,
-  ttlSeconds?: number,
-): { token: string; issuedAt: number; expiresAt: number; jti: string } {
+  opts: SignTokenOptions,
+): Promise<{ token: string; payload: LicensePayload }> {
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = opts.ttlSeconds ?? JWT_TTL_SECONDS;
   const jti = crypto.randomUUID();
-  const issuedAt = Date.now();
-  const payload: TokenPayload = { jti, role };
-  const options: jwt.SignOptions = { algorithm: "RS256" };
-  if (ttlSeconds !== undefined) options.expiresIn = ttlSeconds as never;
-  const token = jwt.sign(payload, deps.keys.privateKey, options);
-  const expiresAt = ttlSeconds !== undefined ? issuedAt + ttlSeconds * 1000 : 0;
-  return { token, issuedAt, expiresAt, jti };
+  const payload: LicensePayload = {
+    sub: opts.userId,
+    iss: ISSUER,
+    aud: AUDIENCE,
+    iat: now,
+    nbf: now,
+    exp: now + ttl,
+    jti,
+    machine_fp: opts.machineFingerprint,
+    plan: opts.plan,
+    features: opts.features,
+    activated_at: opts.activatedAt,
+    role: opts.role,
+  };
+  const token = await new SignJWT(payload as unknown as Record<string, unknown>)
+    .setProtectedHeader({ alg: ALG, typ: "JWT", kid: KID })
+    .sign(deps.keys.privateKey);
+  return { token, payload };
 }
 
-export function verifyToken(deps: AuthDeps, token: string): TokenPayload | null {
+export async function verifyLicenseToken(
+  deps: AuthDeps,
+  token: string,
+): Promise<LicensePayload | null> {
   try {
-    return jwt.verify(token, deps.keys.publicKey, { algorithms: ["RS256"] }) as TokenPayload;
+    const { payload } = await jwtVerify(token, deps.keys.publicKey, {
+      algorithms: [ALG],
+      issuer: ISSUER,
+      audience: AUDIENCE,
+    });
+    return payload as unknown as LicensePayload;
   } catch {
     return null;
   }
 }
 
 export interface AuthedRequest extends Request {
-  auth?: TokenPayload;
+  auth?: LicensePayload;
 }
 
 export function requireAuth(deps: AuthDeps) {
-  return (req: AuthedRequest, res: Response, next: NextFunction): void => {
+  return async (req: AuthedRequest, res: Response, next: NextFunction): Promise<void> => {
     const header = req.headers.authorization;
     if (!header?.startsWith("Bearer ")) {
       res.status(401).json({ error: "missing_token" });
       return;
     }
-    const payload = verifyToken(deps, header.slice(7).trim());
-    if (!payload) { res.status(401).json({ error: "invalid_token" }); return; }
-    if (deps.sessions.isRevoked(payload.jti)) { res.status(401).json({ error: "token_revoked" }); return; }
+    const payload = await verifyLicenseToken(deps, header.slice(7).trim());
+    if (!payload) {
+      res.status(401).json({ error: "invalid_token" });
+      return;
+    }
+    if (deps.licenses.isRevoked(payload.jti)) {
+      res.status(401).json({ error: "ACCESS_REVOKED" });
+      return;
+    }
     req.auth = payload;
     next();
   };
@@ -64,8 +113,14 @@ export function requireAuth(deps: AuthDeps) {
 export function requireRole(role: Role | Role[]) {
   const roles = Array.isArray(role) ? role : [role];
   return (req: AuthedRequest, res: Response, next: NextFunction): void => {
-    if (!req.auth) { res.status(401).json({ error: "unauthenticated" }); return; }
-    if (!roles.includes(req.auth.role)) { res.status(403).json({ error: "forbidden" }); return; }
+    if (!req.auth) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+    if (!roles.includes(req.auth.role)) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
     next();
   };
 }

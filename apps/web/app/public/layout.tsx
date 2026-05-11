@@ -1,8 +1,13 @@
 import { AuthGate } from "@/components/auth-gate";
 
-// The audience scoreboard requires no login: a tablet/projector can land here
-// directly. It mirrors live state from authed admin/private windows via
-// BroadcastChannel and never modifies the source of truth.
+// The audience scoreboard runs without a login UI, but requires an ACTIVE or
+// GRACE license to display ANY tournament data. In DEGRADED / UNLICENSED the
+// gate replaces the view with a generic "Display Unavailable" message so no
+// competitor names or scores leak.
 export default function PublicLayout({ children }: { children: React.ReactNode }) {
-  return <AuthGate allowAnonymous>{children}</AuthGate>;
+  return (
+    <AuthGate allowAnonymous isPublicView>
+      {children}
+    </AuthGate>
+  );
 }

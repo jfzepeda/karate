@@ -1,19 +1,30 @@
 "use client";
 
-import type { AuthSession, AuthUser, SessionInfo, KioskSession } from "@karate/core";
+import type {
+  AuthUser, Role, Feature, KioskSession, LicenseCodeRecord,
+} from "@karate/core";
 
-/**
- * Resolve the backend base URL.
- * - In Electron, the preload script sets window.__KARATE__.serverUrl.
- * - In dev/web, override via NEXT_PUBLIC_KARATE_SERVER_URL or localStorage key
- *   "karate.serverUrl"; otherwise default to localhost:47291.
- */
 declare global {
   interface Window {
     __KARATE__?: {
-      serverUrl?: string;
       isElectron?: boolean;
-      kioskSession?: { token: string; issuedAt: number; expiresAt: number; user: { role: string } } | null;
+      serverUrl?: string;
+      kioskSession?: KioskSession | null;
+      license?: {
+        getBootstrap: () => Promise<{
+          state: unknown;
+          token: string | null;
+          serverUrl: string;
+          machineFingerprint: string;
+          kioskSession: KioskSession | null;
+        }>;
+        getState: () => Promise<{ state: unknown; token: string | null }>;
+        activateCode: (code: string) => Promise<{ ok: boolean; error?: string; state?: unknown; token?: string | null }>;
+        retryRenewal: () => Promise<{ state: unknown; token: string | null }>;
+        reset: () => Promise<{ state: unknown; token: string | null }>;
+        onChange: (cb: (envelope: { state: unknown; token: string | null }) => void) => () => void;
+      };
+      openPublicWindow?: () => void;
     };
   }
 }
@@ -64,9 +75,8 @@ export async function apiRequest<T>(path: string, opts: RequestOptions = {}): Pr
   };
   let body: BodyInit | undefined;
   if (opts.body !== undefined) {
-    if (opts.isForm) {
-      body = opts.body as FormData;
-    } else {
+    if (opts.isForm) body = opts.body as FormData;
+    else {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(opts.body);
     }
@@ -75,10 +85,7 @@ export async function apiRequest<T>(path: string, opts: RequestOptions = {}): Pr
   const url = getServerUrl().replace(/\/+$/, "") + path;
   const res = await fetch(url, {
     method: opts.method ?? "GET",
-    body,
-    headers,
-    signal: opts.signal,
-    cache: "no-store",
+    body, headers, signal: opts.signal, cache: "no-store",
   });
   if (!res.ok) {
     let code = "request_failed";
@@ -87,9 +94,7 @@ export async function apiRequest<T>(path: string, opts: RequestOptions = {}): Pr
       const j = await res.json();
       if (typeof j?.error === "string") code = j.error;
       if (typeof j?.message === "string") message = j.message;
-    } catch {
-      /* not JSON */
-    }
+    } catch { /* not JSON */ }
     throw new ApiError(res.status, code, message);
   }
   if (res.status === 204) return undefined as T;
@@ -98,15 +103,39 @@ export async function apiRequest<T>(path: string, opts: RequestOptions = {}): Pr
   return (await res.json()) as T;
 }
 
-// ---------- Auth endpoints ----------
-export async function apiLogin(code: string): Promise<AuthSession> {
-  return apiRequest("/api/login", {
+// ---------- Licensing ----------
+export interface ActivationResponse {
+  token: string;
+  payload: {
+    sub: string;
+    role: Role;
+    features: Feature[];
+    plan: string;
+    activated_at: number;
+    exp: number;
+    iat: number;
+    jti: string;
+  };
+}
+
+export async function apiActivate(code: string, machineFingerprint: string): Promise<ActivationResponse> {
+  return apiRequest<ActivationResponse>("/api/activate", {
     method: "POST",
-    body: { code },
+    body: { code, machineFingerprint },
   });
 }
 
-export async function apiMe(token: string): Promise<{ user: AuthUser }> {
+export async function apiRenewToken(
+  currentJwt: string,
+  machineFingerprint: string,
+): Promise<ActivationResponse> {
+  return apiRequest<ActivationResponse>("/api/renew-token", {
+    method: "POST",
+    body: { currentJwt, machineFingerprint },
+  });
+}
+
+export async function apiMe(token: string): Promise<{ user: AuthUser; jti: string; exp: number }> {
   return apiRequest("/api/me", { token });
 }
 
@@ -122,19 +151,12 @@ export interface LaunchConfig {
   data: Record<string, unknown>;
 }
 
-export async function apiGenerateLaunch(token: string): Promise<LaunchConfig> {
-  return apiRequest<LaunchConfig>("/api/generate-launch", { token, method: "POST" });
-}
-
 export async function apiPrepareDownload(token: string): Promise<{ tokenId: string }> {
   return apiRequest("/api/prepare-download", { token, method: "POST" });
 }
 
 // ---------- Downloads ----------
-export interface DownloadInfo {
-  mac: string | null;
-  win: string | null;
-}
+export interface DownloadInfo { mac: string | null; win: string | null; }
 
 export async function apiGetDownloadInfo(): Promise<DownloadInfo> {
   return apiRequest("/api/download-info");
@@ -144,26 +166,32 @@ export function downloadUrl(filename: string): string {
   return getServerUrl().replace(/\/+$/, "") + `/api/downloads/${encodeURIComponent(filename)}`;
 }
 
-// ---------- Session management (superadmin) ----------
-export async function apiGetSessions(token: string): Promise<{ sessions: SessionInfo[] }> {
-  return apiRequest("/api/sessions", { token });
+// ---------- License administration (superadmin) ----------
+export async function apiAdminGetLicenses(token: string): Promise<{ licenses: LicenseCodeRecord[] }> {
+  return apiRequest("/api/admin/licenses", { token });
 }
 
-export async function apiRevokeSession(token: string, jti: string): Promise<{ ok: true }> {
-  return apiRequest(`/api/sessions/${encodeURIComponent(jti)}`, { token, method: "DELETE" });
+export async function apiAdminCreateLicense(token: string, body: {
+  role: Role;
+  features?: Feature[];
+  label: string;
+  ttlDays?: number;
+}): Promise<{ code: string; userId: string; label: string; role: Role; features: Feature[]; expiresAt: number }> {
+  return apiRequest("/api/admin/licenses", { token, method: "POST", body });
 }
 
-// ---------- Referee code generation (superadmin) ----------
-export async function apiGenerateRefereeCode(token: string): Promise<{ code: string }> {
-  return apiRequest("/api/referee-code", { token, method: "POST" });
+export async function apiAdminRevokeLicense(token: string, userId: string): Promise<{ ok: true }> {
+  return apiRequest(`/api/admin/licenses/${encodeURIComponent(userId)}/revoke`, { token, method: "POST" });
 }
 
-export async function apiGetRefereeCodes(token: string): Promise<{ codes: { code: string; expiresAt: number }[] }> {
-  return apiRequest("/api/referee-codes", { token });
+export async function apiAdminTransferLicense(token: string, userId: string): Promise<{ ok: true }> {
+  return apiRequest(`/api/admin/licenses/${encodeURIComponent(userId)}/transfer`, { token, method: "POST" });
 }
 
-export async function apiDeleteRefereeCode(token: string, code: string): Promise<{ ok: true }> {
-  return apiRequest(`/api/referee-codes/${encodeURIComponent(code)}`, { token, method: "DELETE" });
+export async function apiAdminExtendLicense(token: string, userId: string, days: number): Promise<{ ok: true; expiresAt: number }> {
+  return apiRequest(`/api/admin/licenses/${encodeURIComponent(userId)}/extend`, {
+    token, method: "POST", body: { days },
+  });
 }
 
 // ---------- Tournament data ----------
@@ -186,12 +214,7 @@ export async function apiPutData(
 }
 
 // ---------- Logo ----------
-export interface LogoInfo {
-  filename: string;
-  mime: string;
-  size: number;
-  url: string;
-}
+export interface LogoInfo { filename: string; mime: string; size: number; url: string; }
 
 export async function apiGetLogoInfo(token: string): Promise<{ logo: LogoInfo | null }> {
   return apiRequest("/api/logo-info", { token });
@@ -200,12 +223,7 @@ export async function apiGetLogoInfo(token: string): Promise<{ logo: LogoInfo | 
 export async function apiUploadLogo(token: string, file: File): Promise<{ logo: LogoInfo | null }> {
   const fd = new FormData();
   fd.append("logo", file);
-  return apiRequest("/api/upload-logo", {
-    token,
-    method: "POST",
-    body: fd,
-    isForm: true,
-  });
+  return apiRequest("/api/upload-logo", { token, method: "POST", body: fd, isForm: true });
 }
 
 export async function apiRemoveLogo(token: string): Promise<{ ok: true }> {
@@ -224,6 +242,3 @@ export async function apiGetAppConfig(token: string): Promise<{ sessionTtlMinute
 export async function apiUpdateAppConfig(token: string, sessionTtlMinutes: number): Promise<{ sessionTtlMinutes: number }> {
   return apiRequest("/api/app-config", { token, method: "PUT", body: { sessionTtlMinutes } });
 }
-
-// Re-export SessionInfo for consumers
-export type { SessionInfo };

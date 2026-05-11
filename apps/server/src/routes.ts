@@ -5,20 +5,19 @@ import * as crypto from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import multer from "multer";
-import { loadAppConfig, saveAppConfig } from "./app-config";
-
-const execFileP = promisify(execFile);
 import type { ServerConfig } from "./config";
+import { FEATURE_PRESETS } from "./config";
 import type { KeyPair } from "./keys";
 import {
-  signToken,
+  signLicenseToken,
   requireAuth,
   requireRole,
   type AuthedRequest,
   type AuthDeps,
+  JWT_TTL_SECONDS,
 } from "./auth";
-import type { SessionStore } from "./session-store";
-import type { KioskSession } from "@karate/core";
+import type { LicenseStore } from "./licenses";
+import type { KioskSession, Role, Feature } from "@karate/core";
 import {
   loadData,
   saveData,
@@ -29,103 +28,344 @@ import {
 } from "./data-store";
 import { logActivity, readActivity } from "./activity";
 import { renderAdminPanelHtml, renderAdminLoginHtml } from "./admin-panel";
+import { loadAppConfig, saveAppConfig } from "./app-config";
+import { RateLimiter, clientIp } from "./rate-limit";
 
-function clientIp(req: Request): string | null {
-  const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd) return fwd.split(",")[0]!.trim();
-  return req.socket.remoteAddress ?? null;
-}
+const execFileP = promisify(execFile);
 
-const SUPERADMIN_CODE = "KAR-IAS";
-
-// In-memory store for single-use referee codes
-const refereeCodes = new Map<string, number>(); // code → expiresAt
-
-function generateRefereeCode(): string {
-  const digits = () => Math.floor(Math.random() * 1000).toString().padStart(3, "0");
-  return `${digits()}-${digits()}`;
-}
-
-export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: SessionStore, kioskSession?: KioskSession | null): Router {
-  const deps: AuthDeps = { config, keys, sessions };
+export function buildRoutes(
+  config: ServerConfig,
+  keys: KeyPair,
+  licenses: LicenseStore,
+  kioskSession?: KioskSession | null,
+): Router {
+  const deps: AuthDeps = { config, keys, licenses };
   const router = Router();
   const auth = requireAuth(deps);
   const superOnly = requireRole("superadmin");
 
-  // ---- Public health/key endpoints --------------------------------
+  // ---------------------------------------------------------------
+  // Rate limiters
+  // ---------------------------------------------------------------
+  const activateLimiter = new RateLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    key: (req) => clientIp(req),
+    exponentialBackoff: true,
+  });
+
+  const renewLimiter = new RateLimiter({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    key: (req) => {
+      const h = req.headers.authorization;
+      if (h?.startsWith("Bearer ")) {
+        // Hash the token so the key length stays bounded.
+        return crypto
+          .createHash("sha256")
+          .update(h.slice(7))
+          .digest("hex")
+          .slice(0, 16);
+      }
+      return clientIp(req);
+    },
+  });
+
+  const generalLimiter = new RateLimiter({
+    windowMs: 60 * 1000,
+    max: 60,
+    key: (req: AuthedRequest) =>
+      req.auth?.sub ?? clientIp(req),
+  });
+
+  // ---------------------------------------------------------------
+  // Public (unauthenticated) endpoints
+  // ---------------------------------------------------------------
   router.get("/api/health", (_req, res) => {
     res.json({ ok: true, ts: Date.now() });
   });
 
   router.get("/api/public-key", (_req, res) => {
-    res.type("text/plain").send(keys.publicKey);
+    res.type("text/plain").send(keys.publicKeySpki);
   });
 
-  // ---- Authentication ---------------------------------------------
-  router.post("/api/login", async (req: Request, res: Response) => {
-    const { code } = req.body ?? {};
-    const ip = clientIp(req);
-    if (typeof code !== "string" || !code.trim()) {
-      res.status(400).json({ error: "missing_code" });
-      return;
-    }
-    const upper = code.trim().toUpperCase();
+  // ---------------------------------------------------------------
+  // POST /api/activate — redeem claim code, issue JWT
+  // ---------------------------------------------------------------
+  router.post(
+    "/api/activate",
+    activateLimiter.middleware,
+    async (req: Request, res: Response) => {
+      const ip = clientIp(req);
+      const body = (req.body ?? {}) as { code?: unknown; machineFingerprint?: unknown };
+      const rawCode =
+        typeof body.code === "string" ? body.code.trim() : "";
+      const machineFingerprint =
+        typeof body.machineFingerprint === "string"
+          ? body.machineFingerprint.trim()
+          : "";
 
-    // Superadmin master code
-    if (upper === SUPERADMIN_CODE) {
-      const { token, issuedAt, expiresAt, jti } = signToken(deps, "superadmin");
-      sessions.add({ jti, role: "superadmin", issuedAt, expiresAt, ip, revoked: false });
-      logActivity(config.dataDir, { ts: Date.now(), username: "superadmin", action: "login", result: "success", ip });
-      res.json({ token, issuedAt, expiresAt, user: { role: "superadmin" } });
-      return;
-    }
+      if (!/^\d{6}$/.test(rawCode)) {
+        activateLimiter.recordFailure(req);
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: null,
+          ip, machineFingerprint, jti: null, result: "fail", reason: "CODE_NOT_FOUND",
+        });
+        res.status(400).json({ error: "CODE_NOT_FOUND" });
+        return;
+      }
+      if (!/^[a-f0-9]{16,128}$/i.test(machineFingerprint)) {
+        activateLimiter.recordFailure(req);
+        res.status(400).json({ error: "INVALID_FINGERPRINT" });
+        return;
+      }
 
-    // Referee numeric code
-    const now = Date.now();
-    // Prune expired codes
-    for (const [k, exp] of refereeCodes) { if (exp < now) refereeCodes.delete(k); }
-    const codeExpiry = refereeCodes.get(upper);
-    if (!codeExpiry || codeExpiry < now) {
-      refereeCodes.delete(upper);
-      logActivity(config.dataDir, { ts: now, username: null, action: "login", result: "fail", ip, message: "invalid_code" });
-      res.status(401).json({ error: "invalid_code" });
-      return;
-    }
-    refereeCodes.delete(upper); // single-use
-    const ttlSeconds = loadAppConfig(config.dataDir).sessionTtlMinutes * 60;
-    const { token, issuedAt, expiresAt, jti } = signToken(deps, "referee", ttlSeconds);
-    sessions.add({ jti, role: "referee", issuedAt, expiresAt, ip, revoked: false });
-    logActivity(config.dataDir, { ts: now, username: "referee", action: "login", result: "success", ip });
-    res.json({ token, issuedAt, expiresAt, user: { role: "referee" } });
-  });
+      const record = licenses.findByCode(rawCode);
+      if (!record) {
+        activateLimiter.recordFailure(req);
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: null,
+          ip, machineFingerprint, jti: null, result: "fail", reason: "CODE_NOT_FOUND",
+        });
+        res.status(404).json({ error: "CODE_NOT_FOUND" });
+        return;
+      }
 
+      if (record.revoked) {
+        activateLimiter.recordFailure(req);
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
+          ip, machineFingerprint, jti: null, result: "fail", reason: "ACCESS_REVOKED",
+        });
+        res.status(403).json({ error: "ACCESS_REVOKED" });
+        return;
+      }
+
+      if (record.expiresAt < Date.now()) {
+        activateLimiter.recordFailure(req);
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
+          ip, machineFingerprint, jti: null, result: "fail", reason: "CODE_EXPIRED",
+        });
+        res.status(410).json({ error: "CODE_EXPIRED" });
+        return;
+      }
+
+      if (record.used && !record.reclaimable) {
+        activateLimiter.recordFailure(req);
+        // Re-activation attempts where the original machine matches are
+        // allowed: this gives a fresh JWT to the same device (e.g. after a
+        // wipe of the local userData). Different machine → reject.
+        if (record.machineFingerprint !== machineFingerprint) {
+          logActivity(config.dataDir, {
+            ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
+            ip, machineFingerprint, jti: null, result: "fail", reason: "CODE_ALREADY_USED",
+          });
+          res.status(409).json({ error: "CODE_ALREADY_USED" });
+          return;
+        }
+      }
+
+      if (licenses.isMachineRegisteredElsewhere(machineFingerprint, record.codeId)) {
+        activateLimiter.recordFailure(req);
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
+          ip, machineFingerprint, jti: null, result: "fail",
+          reason: "MACHINE_ALREADY_REGISTERED",
+        });
+        res.status(409).json({ error: "MACHINE_ALREADY_REGISTERED" });
+        return;
+      }
+
+      const activatedAt = record.activatedAt ?? Math.floor(Date.now() / 1000);
+      const { token, payload } = await signLicenseToken(deps, {
+        userId: record.userId,
+        role: record.role,
+        features: record.features,
+        plan: record.plan,
+        machineFingerprint,
+        activatedAt,
+      });
+      licenses.activate(record.codeId, machineFingerprint, payload.jti);
+
+      activateLimiter.recordSuccess(req);
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "ACTIVATION_SUCCESS", userId: record.userId,
+        ip, machineFingerprint, jti: payload.jti, result: "success",
+      });
+
+      res.json({
+        token,
+        payload: {
+          sub: payload.sub,
+          role: payload.role,
+          features: payload.features,
+          plan: payload.plan,
+          activated_at: payload.activated_at,
+          exp: payload.exp,
+          iat: payload.iat,
+          jti: payload.jti,
+        },
+      });
+    }
+  );
+
+  // ---------------------------------------------------------------
+  // POST /api/renew-token — rotate JWT for an active lineage
+  // ---------------------------------------------------------------
+  router.post(
+    "/api/renew-token",
+    renewLimiter.middleware,
+    async (req: Request, res: Response) => {
+      const ip = clientIp(req);
+      const body = (req.body ?? {}) as {
+        currentJwt?: unknown; machineFingerprint?: unknown;
+      };
+      const currentJwt = typeof body.currentJwt === "string" ? body.currentJwt : "";
+      const machineFingerprint =
+        typeof body.machineFingerprint === "string"
+          ? body.machineFingerprint.trim()
+          : "";
+
+      if (!currentJwt || !machineFingerprint) {
+        res.status(400).json({ error: "missing_field" });
+        return;
+      }
+
+      // Renewal accepts JWTs that are within a short past-expiry window so
+      // a client that woke up after a long sleep can still recover. jose's
+      // jwtVerify will reject `exp <= now`, so we manually parse the
+      // payload for renewal and re-verify the signature without exp.
+      const { jwtVerify, decodeJwt } = await import("jose");
+      let claims: Awaited<ReturnType<typeof decodeJwt>>;
+      try { claims = decodeJwt(currentJwt); }
+      catch {
+        res.status(401).json({ error: "invalid_token" });
+        return;
+      }
+      try {
+        await jwtVerify(currentJwt, keys.publicKey, {
+          algorithms: ["EdDSA"],
+          issuer: "https://api.karate-tournament.app",
+          audience: "karate-tournament-app",
+          // Allow renewal within 7 days of expiry.
+          clockTolerance: "7 days",
+        });
+      } catch {
+        res.status(401).json({ error: "invalid_token" });
+        return;
+      }
+
+      const jti = String(claims.jti ?? "");
+      const sub = String(claims.sub ?? "");
+      const tokenFp = String((claims as Record<string, unknown>)["machine_fp"] ?? "");
+      const record = licenses.findByUserId(sub);
+
+      if (!record) {
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "RENEWAL_FAILURE", userId: sub,
+          ip, machineFingerprint, jti, result: "fail", reason: "USER_NOT_FOUND",
+        });
+        res.status(401).json({ error: "ACCESS_REVOKED" });
+        return;
+      }
+
+      if (record.revoked || licenses.isRevoked(jti)) {
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "RENEWAL_REJECTED_REVOKED", userId: sub,
+          ip, machineFingerprint, jti, result: "fail", reason: "ACCESS_REVOKED",
+        });
+        res.status(401).json({ error: "ACCESS_REVOKED" });
+        return;
+      }
+
+      if (record.machineFingerprint !== machineFingerprint || tokenFp !== machineFingerprint) {
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "MACHINE_MISMATCH", userId: sub,
+          ip, machineFingerprint, jti, result: "fail",
+        });
+        res.status(403).json({ error: "MACHINE_MISMATCH" });
+        return;
+      }
+
+      const activatedAt = record.activatedAt
+        ? Math.floor(record.activatedAt / 1000)
+        : Math.floor(Date.now() / 1000);
+
+      const fresh = await signLicenseToken(deps, {
+        userId: record.userId,
+        role: record.role,
+        features: record.features,
+        plan: record.plan,
+        machineFingerprint,
+        activatedAt,
+      });
+      licenses.rotateJti(record.codeId, fresh.payload.jti);
+
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "RENEWAL_SUCCESS", userId: sub,
+        ip, machineFingerprint, jti: fresh.payload.jti, result: "success",
+      });
+
+      res.json({
+        token: fresh.token,
+        payload: {
+          sub: fresh.payload.sub,
+          role: fresh.payload.role,
+          features: fresh.payload.features,
+          plan: fresh.payload.plan,
+          activated_at: fresh.payload.activated_at,
+          exp: fresh.payload.exp,
+          iat: fresh.payload.iat,
+          jti: fresh.payload.jti,
+        },
+      });
+    }
+  );
+
+  // ---------------------------------------------------------------
+  // Tournament data
+  // ---------------------------------------------------------------
   router.get("/api/me", auth, (req: AuthedRequest, res: Response) => {
-    res.json({ user: { role: req.auth!.role } });
+    res.json({
+      user: {
+        role: req.auth!.role,
+        features: req.auth!.features,
+      },
+      jti: req.auth!.jti,
+      exp: req.auth!.exp,
+    });
   });
 
-  // ---- Tournament data --------------------------------------------
-  router.get("/api/data", auth, (_req: AuthedRequest, res: Response) => {
-    const file = loadData(config.dataDir);
-    res.set("ETag", file.etag);
-    res.json(file);
-  });
+  router.get(
+    "/api/data",
+    auth,
+    generalLimiter.middleware,
+    (_req: AuthedRequest, res: Response) => {
+      const file = loadData(config.dataDir);
+      res.set("ETag", file.etag);
+      res.json(file);
+    }
+  );
 
   router.put("/api/data", auth, superOnly, (req: AuthedRequest, res: Response) => {
     const incoming = req.body && typeof req.body === "object" ? req.body : null;
-    if (!incoming || typeof incoming !== "object") {
+    if (!incoming) {
       res.status(400).json({ error: "invalid_payload" });
       return;
     }
     const file = saveData(config.dataDir, incoming as Record<string, unknown>);
     logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "data_update",
-      result: "success", ip: clientIp(req),
+      ts: Date.now(), event: "data_update", userId: req.auth!.sub,
+      ip: clientIp(req), jti: req.auth!.jti, result: "success",
     });
     res.set("ETag", file.etag);
     res.json(file);
   });
 
-  // ---- Logo upload ------------------------------------------------
+  // ---------------------------------------------------------------
+  // Logo upload
+  // ---------------------------------------------------------------
   const upload = multer({
     storage: multer.diskStorage({
       destination: (_req, _f, cb) => cb(null, ensureLogoDir(config.dataDir)),
@@ -156,7 +396,6 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
       });
     },
     (req: AuthedRequest, res: Response) => {
-      // Delete old files of different extensions so only one logo lives at a time.
       const dir = logoDir(config.dataDir);
       const keep = (req as Request & { file?: Express.Multer.File }).file?.filename;
       for (const f of fs.readdirSync(dir)) {
@@ -164,8 +403,8 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
       }
       const info = readLogoInfo(config.dataDir);
       logActivity(config.dataDir, {
-        ts: Date.now(), username: req.auth!.role, action: "logo_upload",
-        result: "success", ip: clientIp(req),
+        ts: Date.now(), event: "logo_upload", userId: req.auth!.sub,
+        ip: clientIp(req), jti: req.auth!.jti, result: "success",
       });
       res.json({ logo: info });
     }
@@ -174,8 +413,8 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
   router.delete("/api/upload-logo", auth, superOnly, (req: AuthedRequest, res: Response) => {
     clearLogo(config.dataDir);
     logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "logo_remove",
-      result: "success", ip: clientIp(req),
+      ts: Date.now(), event: "logo_remove", userId: req.auth!.sub,
+      ip: clientIp(req), jti: req.auth!.jti, result: "success",
     });
     res.json({ ok: true });
   });
@@ -194,7 +433,9 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     res.json({ logo: readLogoInfo(config.dataDir) });
   });
 
-  // ---- Kiosk session (public) -------------------------------------
+  // ---------------------------------------------------------------
+  // Kiosk session (read-only)
+  // ---------------------------------------------------------------
   router.get("/api/kiosk-session", (_req, res) => {
     if (!kioskSession) {
       res.status(404).json({ error: "not_kiosk" });
@@ -203,52 +444,17 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     res.json(kioskSession);
   });
 
-  // ---- Generate launch config (auth required) ---------------------
-  router.post("/api/generate-launch", auth, async (req: AuthedRequest, res: Response) => {
-    const dataFile = loadData(config.dataDir);
-    const ip = clientIp(req);
-    logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "generate_launch",
-      result: "success", ip,
-    });
-    res.json({
-      issuedAt: Date.now(),
-      expiresAt: Date.now() + loadAppConfig(config.dataDir).sessionTtlMinutes * 60 * 1000,
-      role: req.auth!.role,
-      data: dataFile.data,
-    });
-  });
-
-  // ---- Session management (superadmin) ----------------------------
-  router.get("/api/sessions", auth, superOnly, (_req: AuthedRequest, res: Response) => {
-    res.json({ sessions: sessions.listActive() });
-  });
-
-  router.delete("/api/sessions/:jti", auth, superOnly, (req: AuthedRequest, res: Response) => {
-    const { jti } = req.params;
-    const revoked = sessions.revoke(jti);
-    if (!revoked) {
-      res.status(404).json({ error: "not_found" });
-      return;
-    }
-    logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "session_revoke",
-      result: "success", ip: clientIp(req), message: `jti ${jti}`,
-    });
-    res.json({ ok: true });
-  });
-
-  router.delete("/api/sessions", auth, superOnly, (_req: AuthedRequest, res: Response) => {
-    res.status(404).json({ error: "not_found" });
-  });
-
-  // ---- Activity log -----------------------------------------------
+  // ---------------------------------------------------------------
+  // Activity log (superadmin)
+  // ---------------------------------------------------------------
   router.get("/api/activity", auth, superOnly, (req: AuthedRequest, res: Response) => {
     const max = Math.min(Number(req.query.max ?? 200), 2000);
     res.json({ entries: readActivity(config.dataDir, max) });
   });
 
-  // ---- App config (superadmin) ------------------------------------
+  // ---------------------------------------------------------------
+  // App config (superadmin)
+  // ---------------------------------------------------------------
   router.get("/api/app-config", auth, superOnly, (_req: AuthedRequest, res: Response) => {
     res.json(loadAppConfig(config.dataDir));
   });
@@ -262,38 +468,104 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     const cfg = { sessionTtlMinutes: Math.floor(sessionTtlMinutes) };
     saveAppConfig(config.dataDir, cfg);
     logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "access_extend",
-      result: "success", ip: clientIp(req), message: `set sessionTtlMinutes=${cfg.sessionTtlMinutes}`,
+      ts: Date.now(), event: "access_extend", userId: req.auth!.sub,
+      ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      message: `set sessionTtlMinutes=${cfg.sessionTtlMinutes}`,
     });
     res.json(cfg);
   });
 
-  // ---- Referee access code generation ----------------------------
-  router.post("/api/referee-code", auth, superOnly, (_req: AuthedRequest, res: Response) => {
-    const now = Date.now();
-    for (const [k, exp] of refereeCodes) { if (exp < now) refereeCodes.delete(k); }
-    const code = generateRefereeCode();
-    refereeCodes.set(code, now + loadAppConfig(config.dataDir).sessionTtlMinutes * 60 * 1000);
-    res.json({ code });
+  // ---------------------------------------------------------------
+  // Admin license management (superadmin)
+  // ---------------------------------------------------------------
+  router.get("/api/admin/licenses", auth, superOnly, (_req: AuthedRequest, res: Response) => {
+    res.json({ licenses: licenses.list() });
   });
 
-  router.get("/api/referee-codes", auth, superOnly, (_req: AuthedRequest, res: Response) => {
-    const now = Date.now();
-    const active: { code: string; expiresAt: number }[] = [];
-    for (const [code, expiresAt] of refereeCodes) {
-      if (expiresAt >= now) active.push({ code, expiresAt });
-      else refereeCodes.delete(code);
+  router.post(
+    "/api/admin/licenses",
+    auth,
+    superOnly,
+    (req: AuthedRequest, res: Response) => {
+      const body = (req.body ?? {}) as {
+        role?: Role; features?: Feature[]; label?: string;
+        ttlDays?: number; plan?: string;
+      };
+      const role: Role = body.role === "superadmin" ? "superadmin" : "referee";
+      const features = Array.isArray(body.features) && body.features.length
+        ? body.features
+        : FEATURE_PRESETS[role];
+      const label = (body.label ?? "").trim() || `${role}-${Date.now()}`;
+      const ttlMs = Math.max(1, Number(body.ttlDays ?? 30)) * 24 * 60 * 60 * 1000;
+      const plan = body.plan ?? role;
+      const { code, record } = licenses.createCode({
+        role, features, label, ttlMs, plan,
+      });
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "LICENSE_CODE_CREATED", userId: record.userId,
+        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        message: `role=${role} label=${label}`,
+      });
+      res.json({ code, userId: record.userId, label, role, features, expiresAt: record.expiresAt });
     }
-    res.json({ codes: active });
-  });
+  );
 
-  router.delete("/api/referee-codes/:code", auth, superOnly, (req: Request, res: Response) => {
-    const code = req.params.code.toUpperCase();
-    refereeCodes.delete(code);
-    res.json({ ok: true });
-  });
+  router.post(
+    "/api/admin/licenses/:userId/revoke",
+    auth,
+    superOnly,
+    (req: AuthedRequest, res: Response) => {
+      const codeId = licenses.findCodeIdByUserId(req.params.userId);
+      if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
+      licenses.revokeLineage(codeId);
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "LICENSE_REVOKE", userId: req.params.userId,
+        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      });
+      res.json({ ok: true });
+    }
+  );
 
-  // ---- Custom DMG builder -----------------------------------------
+  router.post(
+    "/api/admin/licenses/:userId/transfer",
+    auth,
+    superOnly,
+    (req: AuthedRequest, res: Response) => {
+      const codeId = licenses.findCodeIdByUserId(req.params.userId);
+      if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
+      licenses.transfer(codeId);
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "LICENSE_TRANSFER", userId: req.params.userId,
+        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      });
+      res.json({ ok: true });
+    }
+  );
+
+  router.post(
+    "/api/admin/licenses/:userId/extend",
+    auth,
+    superOnly,
+    (req: AuthedRequest, res: Response) => {
+      const days = Math.max(1, Number((req.body ?? {}).days ?? 30));
+      const codeId = licenses.findCodeIdByUserId(req.params.userId);
+      if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
+      const newExpiry = Date.now() + days * 24 * 60 * 60 * 1000;
+      const ok = licenses.extendExpiry(codeId, newExpiry);
+      if (!ok) { res.status(409).json({ error: "already_redeemed" }); return; }
+      logActivity(config.dataDir, {
+        ts: Date.now(), event: "LICENSE_EXTEND", userId: req.params.userId,
+        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        message: `+${days}d`,
+      });
+      res.json({ ok: true, expiresAt: newExpiry });
+    }
+  );
+
+  // ---------------------------------------------------------------
+  // Custom DMG builder (used by the superadmin to ship a pre-seeded
+  // tournament). Kept from previous design; now authenticated by JWT.
+  // ---------------------------------------------------------------
   async function createCustomDmg(
     baseDmgPath: string,
     launchConfig: Record<string, unknown>,
@@ -304,43 +576,25 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     const outputBase = `/tmp/karate-out-${tmpId}`;
 
     fs.mkdirSync(mountPoint, { recursive: true });
-
     try {
-      // Mount the original DMG with a shadow file — no copy, no conversion needed.
       await execFileP("/usr/bin/hdiutil", [
         "attach", baseDmgPath,
         "-shadow", shadowFile,
         "-mountpoint", mountPoint,
         "-nobrowse", "-quiet",
       ]);
-
       const appName = fs.readdirSync(mountPoint).find((f) => f.endsWith(".app"));
       if (!appName) throw new Error("No .app found in DMG");
-
       const launchJson = JSON.stringify(launchConfig);
-
-      // Write at the DMG root so it's found when running directly from the DMG.
       fs.writeFileSync(path.join(mountPoint, "karate-launch.json"), launchJson);
-
-      // Also write inside the bundle (Contents/Resources) so it's found after
-      // the user copies the .app to /Applications and the DMG is unmounted.
-      // Since we ship without an Apple code signature, writing here is safe.
       const resourcesDir = path.join(mountPoint, appName, "Contents", "Resources");
       if (fs.existsSync(resourcesDir)) {
         fs.writeFileSync(path.join(resourcesDir, "karate-launch.json"), launchJson);
       }
-
       await execFileP("/usr/bin/hdiutil", ["detach", mountPoint, "-quiet"]);
-
-      // Merge shadow + original into a standard ULFO (lzfse) read-only image.
-      // On Apple Silicon this takes ~1-2 s and produces a normal openable DMG.
       await execFileP("/usr/bin/hdiutil", [
-        "convert", baseDmgPath,
-        "-shadow", shadowFile,
-        "-format", "ULFO",
-        "-o", outputBase,
+        "convert", baseDmgPath, "-shadow", shadowFile, "-format", "ULFO", "-o", outputBase,
       ]);
-
       return `${outputBase}.dmg`;
     } catch (err) {
       await execFileP("/usr/bin/hdiutil", ["detach", mountPoint, "-quiet"]).catch(() => {});
@@ -351,9 +605,7 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     }
   }
 
-  // In-memory store for single-use download tokens (max 5 min TTL)
   const pendingDownloads = new Map<string, { launchConfig: Record<string, unknown>; createdAt: number }>();
-
   function prunePendingDownloads() {
     const cutoff = Date.now() - 5 * 60 * 1000;
     for (const [k, v] of pendingDownloads) {
@@ -363,26 +615,20 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
 
   router.post("/api/prepare-download", auth, async (req: AuthedRequest, res: Response) => {
     const dataFile = loadData(config.dataDir);
-    const ttlMinutes = loadAppConfig(config.dataDir).sessionTtlMinutes;
     const launchConfig = {
       issuedAt: Date.now(),
-      // Give a 2-hour window to finish downloading and open the app.
-      // The actual session TTL is applied when the app starts (see index.ts).
-      expiresAt: Date.now() + Math.max(ttlMinutes * 60 * 1000, 2 * 60 * 60 * 1000),
-      sessionTtlSeconds: ttlMinutes * 60,
+      expiresAt: Date.now() + 2 * 60 * 60 * 1000,
+      sessionTtlSeconds: JWT_TTL_SECONDS,
       role: req.auth!.role,
       data: dataFile.data,
     };
-
     prunePendingDownloads();
     const tokenId = crypto.randomUUID();
     pendingDownloads.set(tokenId, { launchConfig, createdAt: Date.now() });
-
     logActivity(config.dataDir, {
-      ts: Date.now(), username: req.auth!.role, action: "prepare_download",
-      result: "success", ip: clientIp(req),
+      ts: Date.now(), event: "prepare_download", userId: req.auth!.sub,
+      ip: clientIp(req), jti: req.auth!.jti, result: "success",
     });
-
     res.json({ tokenId });
   });
 
@@ -390,11 +636,9 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     const entry = pendingDownloads.get(req.params.tokenId);
     if (!entry) { res.status(404).json({ error: "not_found" }); return; }
     pendingDownloads.delete(req.params.tokenId);
-
     const dmgInfo = scanDownloads();
     if (!dmgInfo.mac) { res.status(404).json({ error: "no_installer" }); return; }
     const baseDmgPath = path.join(downloadsDir(), dmgInfo.mac);
-
     let outputDmg: string | null = null;
     try {
       outputDmg = await createCustomDmg(baseDmgPath, entry.launchConfig);
@@ -411,11 +655,9 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     }
   });
 
-  // ---- Downloads (public) -----------------------------------------
   function downloadsDir(): string {
     return path.join(config.dataDir, "downloads");
   }
-
   function scanDownloads(): { mac: string | null; win: string | null } {
     const dir = downloadsDir();
     if (!fs.existsSync(dir)) return { mac: null, win: null };
@@ -424,18 +666,11 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     const win = files.find((f) => f.toLowerCase().endsWith(".exe")) ?? null;
     return { mac, win };
   }
-
-  router.get("/api/download-info", (_req, res) => {
-    res.json(scanDownloads());
-  });
-
+  router.get("/api/download-info", (_req, res) => { res.json(scanDownloads()); });
   router.get("/api/downloads/:filename", (req: Request, res: Response) => {
     const filename = path.basename(req.params.filename);
     const filepath = path.join(downloadsDir(), filename);
-    if (!fs.existsSync(filepath)) {
-      res.status(404).json({ error: "not_found" });
-      return;
-    }
+    if (!fs.existsSync(filepath)) { res.status(404).json({ error: "not_found" }); return; }
     const ext = path.extname(filename).toLowerCase();
     const contentType = ext === ".dmg" ? "application/x-apple-diskimage"
       : ext === ".exe" ? "application/vnd.microsoft.portable-executable"
@@ -446,8 +681,9 @@ export function buildRoutes(config: ServerConfig, keys: KeyPair, sessions: Sessi
     fs.createReadStream(filepath).pipe(res);
   });
 
-  // ---- Admin panel (HTML) -----------------------------------------
-  // The admin panel uses a separate cookie-style session backed by JWT in localStorage.
+  // ---------------------------------------------------------------
+  // Admin panel HTML
+  // ---------------------------------------------------------------
   router.get("/admin-panel", (_req, res) => {
     res.type("html").send(renderAdminPanelHtml());
   });

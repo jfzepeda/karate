@@ -1,73 +1,94 @@
 "use client";
 
 import { useState } from "react";
+import type { LicenseDegradedReason } from "@karate/core";
 import { useAuth } from "@/lib/auth-context";
 
-export function LockScreen({ reason }: { reason: string }) {
+const REASON_COPY: Record<LicenseDegradedReason, { title: string; body: string }> = {
+  EXPIRED: {
+    title: "License expired",
+    body: "Your license has expired. Enter a new access code below or contact your administrator to renew.",
+  },
+  REVOKED: {
+    title: "Access revoked",
+    body: "This license has been revoked. If you believe this is a mistake, contact your administrator.",
+  },
+  MACHINE_MISMATCH: {
+    title: "Device not recognized",
+    body: "This license is registered to a different device. Ask your administrator to transfer it, then enter the original code.",
+  },
+  CLOCK_TAMPER: {
+    title: "Clock error",
+    body: "Your system clock appears to have moved backward. Set the correct date and time, then restart the app.",
+  },
+  INVALID_SIGNATURE: {
+    title: "Invalid license",
+    body: "Your license file failed verification. Enter a new access code below to reactivate.",
+  },
+  STORAGE_CORRUPTED: {
+    title: "License storage corrupted",
+    body: "We could not read the locally-cached license. Enter your access code below to reactivate.",
+  },
+};
+
+export function LockScreen({ reason }: { reason: LicenseDegradedReason | string }) {
   const { redeemCode } = useAuth();
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const isKioskExpired = reason === "kiosk_expired";
-  const isSessionExpired = reason === "session_expired";
+  const info = REASON_COPY[reason as LicenseDegradedReason] ?? {
+    title: "Access restricted",
+    body: typeof reason === "string" ? reason : "Unknown reason.",
+  };
 
   async function handleRedeem(e: React.FormEvent) {
     e.preventDefault();
-    if (!code.trim()) return;
+    if (!/^\d{6}$/.test(code)) {
+      setError("Enter a 6-digit code.");
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      await redeemCode(code.trim());
-    } catch {
-      setError("Código inválido o expirado");
+      await redeemCode(code);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not activate");
     } finally {
       setLoading(false);
     }
   }
 
-  if (isKioskExpired) {
-    return (
-      <div className="auth-screen">
-        <div className="auth-card auth-locked">
-          <h1>Token expirado</h1>
-          <p>El tiempo de acceso ha terminado.</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (isSessionExpired) {
-    return (
-      <div className="auth-screen">
-        <div className="auth-card auth-locked">
-          <h1>Sesión expirada</h1>
-          <p>Contacta al administrador para obtener un código de acceso.</p>
-          <form onSubmit={handleRedeem} style={{ marginTop: 16 }}>
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              placeholder="XXX-XXX"
-              maxLength={7}
-              style={{ textAlign: "center", letterSpacing: 4, fontSize: 18, width: "100%", marginBottom: 10 }}
-              autoFocus
-            />
-            {error && <p style={{ color: "var(--red, #e05252)", marginBottom: 8, fontSize: 13 }}>{error}</p>}
-            <button type="submit" className="primary" disabled={loading || !code.trim()} style={{ width: "100%" }}>
-              {loading ? "Verificando…" : "Ingresar"}
-            </button>
-          </form>
-        </div>
-      </div>
-    );
-  }
-
-  // Generic fallback for other lock reasons (account_revoked, offline, etc.)
   return (
     <div className="auth-screen">
       <div className="auth-card auth-locked">
-        <h1>Acceso restringido</h1>
-        <p>{reason}</p>
+        <h1>{info.title}</h1>
+        <p>{info.body}</p>
+        <form onSubmit={handleRedeem} style={{ marginTop: 18 }}>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 6 }}>
+            Have a new access code? Enter it here to reactivate.
+          </p>
+          <input
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+            placeholder="000000"
+            maxLength={6}
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            style={{
+              textAlign: "center",
+              letterSpacing: 8,
+              fontSize: 22,
+              width: "100%",
+              marginBottom: 10,
+              fontFamily: "ui-monospace, Menlo, monospace",
+            }}
+          />
+          {error && <p style={{ color: "var(--red, #e05252)", marginBottom: 8, fontSize: 13 }}>{error}</p>}
+          <button type="submit" className="primary" disabled={loading || code.length !== 6} style={{ width: "100%" }}>
+            {loading ? "Activating…" : "Reactivate"}
+          </button>
+        </form>
       </div>
     </div>
   );

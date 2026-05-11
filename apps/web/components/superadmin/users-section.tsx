@@ -1,175 +1,202 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import type { SessionInfo } from "@karate/core";
+import type { LicenseCodeRecord, Role } from "@karate/core";
 import { useAuth } from "@/lib/auth-context";
 import {
-  apiGenerateRefereeCode,
-  apiGetRefereeCodes,
-  apiDeleteRefereeCode,
+  apiAdminGetLicenses,
+  apiAdminCreateLicense,
+  apiAdminRevokeLicense,
+  apiAdminTransferLicense,
+  apiAdminExtendLicense,
   apiGetAppConfig,
   apiUpdateAppConfig,
-  apiGetSessions,
-  apiRevokeSession,
 } from "@/lib/api-client";
-
-function Countdown({ expiresAt }: { expiresAt: number }) {
-  const [remaining, setRemaining] = useState(() => Math.max(0, expiresAt - Date.now()));
-  useEffect(() => {
-    const t = setInterval(() => setRemaining(Math.max(0, expiresAt - Date.now())), 1000);
-    return () => clearInterval(t);
-  }, [expiresAt]);
-  if (remaining <= 0) return <span style={{ color: "var(--red, #e05252)" }}>expirado</span>;
-  const s = Math.floor(remaining / 1000);
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  const color = remaining < 60_000 ? "var(--red, #e05252)" : remaining < 120_000 ? "#f0a500" : "#4ade80";
-  return <span style={{ color, fontVariantNumeric: "tabular-nums" }}>{m}:{String(sec).padStart(2, "0")}</span>;
-}
 
 export function UsersSection() {
   const { token } = useAuth();
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [pendingCodes, setPendingCodes] = useState<{ code: string; expiresAt: number }[]>([]);
-  const [ttlInput, setTtlInput] = useState("480");
+  const [licenses, setLicenses] = useState<LicenseCodeRecord[]>([]);
+  const [newLabel, setNewLabel] = useState("");
+  const [newRole, setNewRole] = useState<Role>("referee");
+  const [newTtl, setNewTtl] = useState("30");
+  const [lastCode, setLastCode] = useState<string | null>(null);
+  const [ttlMinutes, setTtlMinutes] = useState("480");
   const [savingTtl, setSavingTtl] = useState(false);
-  const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!token) return;
     setLoading(true);
     try {
-      const [s, codes, cfg] = await Promise.all([
-        apiGetSessions(token),
-        apiGetRefereeCodes(token),
+      const [list, cfg] = await Promise.all([
+        apiAdminGetLicenses(token),
         apiGetAppConfig(token),
       ]);
-      setSessions(s.sessions.filter((s) => s.role !== "superadmin"));
-      setPendingCodes(codes.codes);
-      setTtlInput(String(cfg.sessionTtlMinutes));
-    } catch { /* ignore */ } finally { setLoading(false); }
+      setLicenses(list.licenses);
+      setTtlMinutes(String(cfg.sessionTtlMinutes));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "fetch_failed");
+    } finally { setLoading(false); }
   }, [token]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  useEffect(() => {
-    const t = setInterval(() => { void refresh(); }, 10_000);
-    return () => clearInterval(t);
-  }, [refresh]);
-
-  async function handleGenerateCode() {
+  async function handleCreate() {
     if (!token) return;
+    if (!newLabel.trim()) { setError("Label is required."); return; }
+    setError(null);
     setGenerating(true);
     try {
-      await apiGenerateRefereeCode(token);
+      const r = await apiAdminCreateLicense(token, {
+        role: newRole,
+        label: newLabel.trim(),
+        ttlDays: parseInt(newTtl, 10) || 30,
+      });
+      setLastCode(r.code);
+      setNewLabel("");
       await refresh();
-    } catch { alert("Error generando código"); } finally { setGenerating(false); }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "create_failed");
+    } finally { setGenerating(false); }
   }
 
-  async function handleDeleteCode(code: string) {
+  async function handleRevoke(userId: string) {
     if (!token) return;
-    try {
-      await apiDeleteRefereeCode(token, code);
-      setPendingCodes((prev) => prev.filter((c) => c.code !== code));
-    } catch { /* ignore */ }
+    if (!confirm("Revoke this license? The registered device will lose access on next renewal.")) return;
+    try { await apiAdminRevokeLicense(token, userId); refresh(); }
+    catch (e) { setError(e instanceof Error ? e.message : "revoke_failed"); }
   }
 
-  async function handleRevoke(jti: string) {
+  async function handleTransfer(userId: string) {
     if (!token) return;
-    try {
-      await apiRevokeSession(token, jti);
-      setSessions((prev) => prev.filter((s) => s.jti !== jti));
-    } catch { /* ignore */ }
+    if (!confirm("Reset the machine fingerprint? The original code becomes reclaimable on a new device.")) return;
+    try { await apiAdminTransferLicense(token, userId); refresh(); }
+    catch (e) { setError(e instanceof Error ? e.message : "transfer_failed"); }
+  }
+
+  async function handleExtend(userId: string) {
+    if (!token) return;
+    const days = parseInt(prompt("Extend by how many days?", "30") || "0", 10);
+    if (!days || days < 1) return;
+    try { await apiAdminExtendLicense(token, userId, days); refresh(); }
+    catch (e) { setError(e instanceof Error ? e.message : "extend_failed"); }
   }
 
   async function handleSaveTtl() {
     if (!token) return;
-    const val = parseInt(ttlInput, 10);
-    if (!val || val < 1) return;
+    const v = parseInt(ttlMinutes, 10);
+    if (!v || v < 1) return;
     setSavingTtl(true);
-    try { await apiUpdateAppConfig(token, val); } finally { setSavingTtl(false); }
+    try { await apiUpdateAppConfig(token, v); } finally { setSavingTtl(false); }
   }
-
-  const hasActivity = pendingCodes.length > 0 || sessions.length > 0;
 
   return (
     <section className="super-section">
       <h2 style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        Acceso & Sesiones
+        Licenses
         <button onClick={refresh} disabled={loading} style={{ fontSize: 13 }}>
-          {loading ? "Cargando…" : "Actualizar"}
+          {loading ? "Loading…" : "Refresh"}
         </button>
       </h2>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, padding: "10px 14px", background: "rgba(74,222,128,0.07)", border: "1px solid rgba(74,222,128,0.2)", borderRadius: 8 }}>
-        <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 4, background: "rgba(74,222,128,0.15)", color: "#4ade80", whiteSpace: "nowrap" }}>superadmin</span>
-        <span style={{ fontFamily: "monospace", fontSize: 20, letterSpacing: 4, fontWeight: 700 }}>KAR-IAS</span>
-        <span style={{ fontSize: 12, color: "var(--muted, #8892a4)" }}>· nunca expira</span>
-      </div>
-
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, padding: "10px 14px", background: "var(--panel-2, #1d2230)", borderRadius: 8 }}>
-        <span style={{ fontSize: 13, color: "var(--muted, #8892a4)" }}>Duración de sesión:</span>
-        <input type="number" min={1} value={ttlInput} onChange={(e) => setTtlInput(e.target.value)} style={{ width: 70 }} />
-        <span style={{ fontSize: 13, color: "var(--muted, #8892a4)" }}>minutos</span>
+        <span style={{ fontSize: 13, color: "var(--muted, #8892a4)" }}>Kiosk session TTL:</span>
+        <input type="number" min={1} value={ttlMinutes} onChange={(e) => setTtlMinutes(e.target.value)} style={{ width: 80 }} />
+        <span style={{ fontSize: 13, color: "var(--muted, #8892a4)" }}>minutes</span>
         <button className="primary" style={{ fontSize: 12 }} disabled={savingTtl} onClick={handleSaveTtl}>
-          {savingTtl ? "Guardando…" : "Guardar"}
+          {savingTtl ? "Saving…" : "Save"}
         </button>
       </div>
 
-      <div style={{ marginBottom: 20 }}>
-        <button className="primary" onClick={handleGenerateCode} disabled={generating}>
-          {generating ? "Generando…" : "Generar código de referee"}
-        </button>
+      <div style={{ padding: 14, background: "var(--panel-2, #1d2230)", borderRadius: 8, marginBottom: 14 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Generate claim code</div>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+          <input
+            placeholder="Label (e.g. Club Guadalajara – Area 1)"
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            style={{ flex: 1, minWidth: 200 }}
+          />
+          <select value={newRole} onChange={(e) => setNewRole(e.target.value as Role)}>
+            <option value="referee">Referee</option>
+            <option value="superadmin">Superadmin</option>
+          </select>
+          <input
+            type="number"
+            min={1}
+            value={newTtl}
+            onChange={(e) => setNewTtl(e.target.value)}
+            style={{ width: 70 }}
+            title="Days until the code expires if unused"
+          />
+          <span style={{ fontSize: 12, color: "var(--muted, #8892a4)" }}>days</span>
+          <button className="primary" disabled={generating} onClick={handleCreate}>
+            {generating ? "Generating…" : "Generate"}
+          </button>
+        </div>
+        {lastCode && (
+          <div style={{ marginTop: 12, padding: 12, background: "#0f1117", borderRadius: 6, textAlign: "center" }}>
+            <div style={{ fontSize: 12, color: "var(--muted, #8892a4)", marginBottom: 6 }}>New code (shown once)</div>
+            <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 28, letterSpacing: 10, fontWeight: 700 }}>
+              {lastCode}
+            </div>
+            <button style={{ marginTop: 10, fontSize: 12 }} onClick={() => setLastCode(null)}>Dismiss</button>
+          </div>
+        )}
       </div>
 
-      {!hasActivity ? (
-        <p className="muted" style={{ fontSize: 13 }}>Sin códigos ni sesiones activas</p>
+      {error && <div style={{ color: "var(--red, #e05252)", marginBottom: 10 }}>{error}</div>}
+
+      {licenses.length === 0 ? (
+        <p className="muted" style={{ fontSize: 13 }}>No licenses yet.</p>
       ) : (
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
           <thead>
             <tr style={{ borderBottom: "1px solid var(--border, #2a3142)" }}>
-              <th style={th}>Tipo</th>
-              <th style={th}>Código / Inicio</th>
-              <th style={th}>Expira en</th>
-              <th style={th}>IP</th>
+              <th style={th}>Label</th>
+              <th style={th}>Role</th>
+              <th style={th}>Status</th>
+              <th style={th}>Expires</th>
+              <th style={th}>Machine</th>
+              <th style={th}>Last renewal</th>
               <th style={th}></th>
             </tr>
           </thead>
           <tbody>
-            {pendingCodes.map((c) => (
-              <tr key={c.code} style={{ borderBottom: "1px solid var(--border, #2a3142)" }}>
+            {licenses.map((l) => (
+              <tr key={l.userId} style={{ borderBottom: "1px solid var(--border, #2a3142)" }}>
+                <td style={td}>{l.label}</td>
+                <td style={td}>{l.role}</td>
                 <td style={td}>
-                  <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 4, background: "rgba(250,204,21,0.15)", color: "#facc15" }}>
-                    código pendiente
-                  </span>
+                  <span style={{
+                    fontSize: 11, padding: "2px 7px", borderRadius: 4,
+                    color: l.status === "active" ? "#4ade80"
+                         : l.status === "revoked" ? "#e25c5c"
+                         : l.status === "expired" ? "#d8a84b"
+                         : "#8892a4",
+                    background: l.status === "active" ? "rgba(74,222,128,0.12)"
+                              : l.status === "revoked" ? "rgba(226,92,92,0.12)"
+                              : l.status === "expired" ? "rgba(216,168,75,0.12)"
+                              : "rgba(136,146,164,0.12)",
+                  }}>{l.status}</span>
                 </td>
+                <td style={td}>{new Date(l.expiresAt).toLocaleDateString()}</td>
+                <td style={td} className="muted">{l.machineFingerprintTail ?? "—"}</td>
+                <td style={td} className="muted">{l.lastRenewalAt ? new Date(l.lastRenewalAt).toLocaleString() : "—"}</td>
                 <td style={td}>
-                  <span style={{ fontFamily: "monospace", fontSize: 16, letterSpacing: 3, fontWeight: 700 }}>{c.code}</span>
-                </td>
-                <td style={td}><Countdown expiresAt={c.expiresAt} /></td>
-                <td style={td}><span className="muted">—</span></td>
-                <td style={td}>
-                  <button onClick={() => handleDeleteCode(c.code)} style={revokeBtn}>eliminar</button>
-                </td>
-              </tr>
-            ))}
-            {sessions.map((s) => (
-              <tr key={s.jti} style={{ borderBottom: "1px solid var(--border, #2a3142)" }}>
-                <td style={td}>
-                  <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 4, background: "rgba(74,222,128,0.1)", color: "#4ade80" }}>
-                    sesión activa
-                  </span>
-                </td>
-                <td style={td}>
-                  <span className="muted" style={{ fontSize: 11 }}>
-                    {new Date(s.issuedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                </td>
-                <td style={td}><Countdown expiresAt={s.expiresAt} /></td>
-                <td style={td}><span className="muted">{s.ip ?? "—"}</span></td>
-                <td style={td}>
-                  <button onClick={() => handleRevoke(s.jti)} style={revokeBtn}>revocar</button>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {l.status !== "revoked" && (
+                      <button onClick={() => handleRevoke(l.userId)} style={dangerBtn}>Revoke</button>
+                    )}
+                    {l.status === "active" && (
+                      <button onClick={() => handleTransfer(l.userId)} style={subtleBtn}>Transfer</button>
+                    )}
+                    {l.status === "unused" && (
+                      <button onClick={() => handleExtend(l.userId)} style={subtleBtn}>Extend</button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
@@ -182,4 +209,5 @@ export function UsersSection() {
 
 const th: React.CSSProperties = { textAlign: "left", padding: "6px 8px", color: "var(--muted, #8892a4)", fontWeight: 500, fontSize: 12 };
 const td: React.CSSProperties = { padding: "8px 8px", verticalAlign: "middle" };
-const revokeBtn: React.CSSProperties = { fontSize: 10, padding: "1px 6px", color: "var(--red, #e05252)", background: "none", border: "1px solid var(--red, #e05252)", borderRadius: 3, cursor: "pointer" };
+const dangerBtn: React.CSSProperties = { fontSize: 10, padding: "1px 6px", color: "var(--red, #e05252)", background: "none", border: "1px solid var(--red, #e05252)", borderRadius: 3, cursor: "pointer" };
+const subtleBtn: React.CSSProperties = { fontSize: 10, padding: "1px 6px", color: "var(--muted, #8892a4)", background: "none", border: "1px solid var(--border, #2a3142)", borderRadius: 3, cursor: "pointer" };

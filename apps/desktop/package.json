@@ -5,8 +5,9 @@
   "main": "main.js",
   "description": "Karate Tournament desktop wrapper (Electron + bundled server + Next.js export)",
   "scripts": {
-    "build:server": "esbuild ../server/src/index.ts --bundle --platform=node --target=node18 --outfile=dist-server/index.js",
+    "build:server": "esbuild ../server/src/index.ts --bundle --platform=node --target=node18 --outfile=dist-server/index.js --external:electron",
     "build:web": "cross-env KARATE_EXPORT=1 pnpm --filter @karate/web build",
+    "afterPack:fuses": "node scripts/apply-fuses.js",
     "prepackage": "pnpm build:server && pnpm build:web",
     "dev": "electron .",
     "package": "pnpm prepackage && electron-builder",
@@ -16,13 +17,16 @@
     "typecheck": "echo \"(no TS in desktop)\""
   },
   "dependencies": {
-    "@karate/server": "workspace:*"
+    "@karate/server": "workspace:*",
+    "jose": "^5.9.6",
+    "node-machine-id": "^1.1.12"
   },
   "devDependencies": {
+    "@electron/fuses": "^1.8.0",
     "cross-env": "^7.0.3",
-    "electron": "^33.0.2",
-    "esbuild": "^0.25.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^37.3.1",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.0"
   },
   "build": {
     "appId": "io.karate.tournament",
@@ -30,9 +34,11 @@
     "directories": {
       "output": "dist-electron"
     },
+    "afterPack": "scripts/apply-fuses.js",
     "files": [
       "main.js",
       "preload.js",
+      "licensing/**/*",
       "renderer/**/*",
       "server/**/*",
       "package.json",

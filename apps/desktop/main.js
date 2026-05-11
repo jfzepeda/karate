@@ -1,42 +1,41 @@
 // Electron main process for the Karate Tournament desktop app.
 //
-// Layout:
-//   1. On startup, spawn an in-process Express server (the @karate/server
-//      package). The server hosts the JSON API, the /admin-panel HTML, and
-//      the Next.js export's static assets — all on a single localhost port.
-//   2. Open a primary BrowserWindow pointed at the server.
-//   3. Expose a small preload bridge so the renderer can:
-//        - read the resolved server URL
-//        - request a second BrowserWindow for the public scoreboard
-//        - know that it's running inside Electron (window.__KARATE__.isElectron)
+// Boot sequence:
+//   1. Resolve machine fingerprint (hardware-bound, hashed).
+//   2. Start the bundled @karate/server on a localhost port. In dev the
+//      server is also the licensing authority; in production this same
+//      server runs remotely on Anthropic-owned infra and the desktop talks
+//      to it over HTTPS (set KARATE_LICENSING_URL).
+//   3. Load and evaluate the cached license. State machine returns one of:
+//        unlicensed / active / grace / degraded
+//   4. Open the primary window; pass the license state to the renderer via
+//      preload. The renderer chooses login / lock / app UI accordingly.
+//   5. Public scoreboard window is gated by `canShowPublicWindow()` — never
+//      opened in degraded or unlicensed state.
 //
-// Data persistence lives in the user's home directory (`~/.karate-tournament`)
-// — nothing inside the app bundle is mutated.
+// All license file I/O, JWT crypto, and machine fingerprinting happen here.
+// The renderer only ever sees the redacted public license shape.
 
-const { app, BrowserWindow, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, screen, dialog } = require("electron");
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
 
+const licensing = require("./licensing");
+const { fetchPublicKey } = require("./licensing/server-client");
+
 const isPackaged = app.isPackaged;
 const ROOT = __dirname;
 
-// Resolve the bundled @karate/server. In dev (unpackaged) we load it via
-// require resolution from the workspace; in packaged builds it's copied into
-// `process.resourcesPath/server/index.js`.
 function resolveServerModule() {
   if (isPackaged) {
-    const p = path.join(process.resourcesPath, "server", "index.js");
-    return require(p);
+    return require(path.join(process.resourcesPath, "server", "index.js"));
   }
-  // dev: project workspace path
   return require(path.join(ROOT, "..", "server", "dist", "index.js"));
 }
 
 function resolveStaticDir() {
-  if (isPackaged) {
-    return path.join(process.resourcesPath, "renderer");
-  }
+  if (isPackaged) return path.join(process.resourcesPath, "renderer");
   return path.join(ROOT, "..", "web", "out");
 }
 
@@ -44,15 +43,17 @@ let primaryWindow = null;
 let publicWindow = null;
 let serverHandle = null;
 let serverUrl = null;
+let licensingUrl = null;
+let machineFp = null;
+let currentState = null;
+let renewTimer = null;
 
 function readLaunchConfig() {
-  // process.resourcesPath = <App>.app/Contents/Resources — three levels up is the DMG root
-  // or the folder the user placed the app in.
   const appParentDir = path.dirname(path.dirname(path.dirname(process.resourcesPath)));
   const candidates = isPackaged
     ? [
-        path.join(appParentDir, "karate-launch.json"),          // next to the .app (DMG root)
-        path.join(process.resourcesPath, "karate-launch.json"), // legacy: injected inside bundle
+        path.join(appParentDir, "karate-launch.json"),
+        path.join(process.resourcesPath, "karate-launch.json"),
       ]
     : [
         path.join(os.homedir(), "Downloads", "karate-launch.json"),
@@ -81,8 +82,74 @@ async function startServer() {
   const { url, port } = await serverHandle.start();
   serverUrl = url;
   kioskSession = serverHandle.kioskSession ?? null;
-  // eslint-disable-next-line no-console
   console.log(`[karate-desktop] server listening on ${url} (port ${port})`);
+}
+
+function currentToken() {
+  const userDataPath = app.getPath("userData");
+  try {
+    const rec = licensing.storage.loadLicense(userDataPath);
+    if (!rec || !rec.jwt) return null;
+    if (currentState && (currentState.kind === "active" || currentState.kind === "grace")) {
+      return rec.jwt;
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function refreshLicenseState() {
+  const userDataPath = app.getPath("userData");
+  try {
+    currentState = await licensing.evaluate({
+      userDataPath, machineFp, serverUrl: licensingUrl,
+    });
+  } catch (err) {
+    console.error("[karate-desktop] license eval failed", err);
+    currentState = { kind: "degraded", reason: "STORAGE_CORRUPTED", lastRole: null };
+  }
+  broadcastState();
+  scheduleNextRenew();
+  applyStateToWindows();
+  return currentState;
+}
+
+function broadcastState() {
+  const envelope = { state: currentState, token: currentToken() };
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) {
+      w.webContents.send("karate:license-state", envelope);
+    }
+  }
+}
+
+function scheduleNextRenew() {
+  if (renewTimer) clearTimeout(renewTimer);
+  if (!currentState) return;
+  let delay;
+  if (currentState.kind === "active") {
+    // Re-evaluate at the silent-renew threshold (or 1 hour from now,
+    // whichever is sooner).
+    delay = Math.max(60_000, Math.min(60 * 60_000, currentState.license.expiresAt - Date.now() - 60_000));
+  } else if (currentState.kind === "grace") {
+    delay = Math.min(60_000, currentState.graceRemainingMs);
+  } else {
+    delay = 5 * 60_000; // poll less frequently in degraded/unlicensed
+  }
+  renewTimer = setTimeout(() => { refreshLicenseState().catch(() => {}); }, delay);
+}
+
+function canShowPublicWindow() {
+  if (!currentState) return false;
+  if (currentState.kind === "active") return true;
+  if (currentState.kind === "grace") return true;
+  return false;
+}
+
+function applyStateToWindows() {
+  if (!canShowPublicWindow() && publicWindow && !publicWindow.isDestroyed()) {
+    publicWindow.close();
+    publicWindow = null;
+  }
 }
 
 function commonWebPreferences() {
@@ -91,9 +158,7 @@ function commonWebPreferences() {
     contextIsolation: true,
     nodeIntegration: false,
     sandbox: false,
-    additionalArguments: [
-      `--karate-server-url=${serverUrl}`,
-    ],
+    additionalArguments: [`--karate-server-url=${serverUrl}`],
   };
 }
 
@@ -108,17 +173,19 @@ function createPrimaryWindow() {
     webPreferences: commonWebPreferences(),
   });
   primaryWindow.loadURL(serverUrl);
-  primaryWindow.on("closed", () => {
-    primaryWindow = null;
-  });
+  primaryWindow.webContents.on("did-finish-load", () => broadcastState());
+  primaryWindow.on("closed", () => { primaryWindow = null; });
 }
 
 function createPublicWindow() {
+  if (!canShowPublicWindow()) {
+    console.warn("[karate-desktop] public window blocked: license", currentState && currentState.kind);
+    return null;
+  }
   if (publicWindow && !publicWindow.isDestroyed()) {
     publicWindow.focus();
     return publicWindow;
   }
-  // Try to place the public window on a secondary display when one exists.
   const all = screen.getAllDisplays();
   const target =
     all.find((d) => d.id !== screen.getPrimaryDisplay().id) || screen.getPrimaryDisplay();
@@ -133,18 +200,31 @@ function createPublicWindow() {
     webPreferences: commonWebPreferences(),
   });
   publicWindow.loadURL(serverUrl + "/public");
-  publicWindow.on("closed", () => {
-    publicWindow = null;
-  });
+  publicWindow.webContents.on("did-finish-load", () => broadcastState());
+  publicWindow.on("closed", () => { publicWindow = null; });
   return publicWindow;
 }
 
 app.whenReady().then(async () => {
   try {
     await startServer();
+    machineFp = licensing.getMachineFingerprint(app.getPath("userData"));
+    licensingUrl = process.env.KARATE_LICENSING_URL || serverUrl;
+
+    // Dev mode: pull the locally-spawned server's public key into the
+    // validator so we can verify JWTs end-to-end without shipping a key.
+    // Production builds embed the key statically in validator.js.
+    try {
+      const spki = await fetchPublicKey(licensingUrl);
+      licensing.trustDynamicPublicKey(spki);
+    } catch (err) {
+      console.warn("[karate-desktop] could not fetch dynamic public key:", err.message);
+    }
+
+    await refreshLicenseState();
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[karate-desktop] failed to start server", err);
+    console.error("[karate-desktop] startup failed", err);
+    dialog.showErrorBox("Startup failure", String(err));
     app.quit();
     return;
   }
@@ -153,7 +233,43 @@ app.whenReady().then(async () => {
   ipcMain.on("karate:get-kiosk-session", (event) => {
     event.returnValue = kioskSession;
   });
+  ipcMain.handle("karate:get-license-state", () => ({ state: currentState, token: currentToken() }));
+  ipcMain.handle("karate:get-license-bootstrap", () => ({
+    state: currentState,
+    token: currentToken(),
+    serverUrl,
+    machineFingerprint: machineFp,
+    kioskSession,
+  }));
+
+  ipcMain.handle("karate:activate-code", async (_evt, code) => {
+    if (typeof code !== "string" || !/^\d{6}$/.test(code)) {
+      return { ok: false, error: "CODE_NOT_FOUND" };
+    }
+    try {
+      currentState = await licensing.activateCode({
+        userDataPath: app.getPath("userData"),
+        machineFp, serverUrl: licensingUrl, code,
+      });
+      broadcastState();
+      scheduleNextRenew();
+      return { ok: true, state: currentState, token: currentToken() };
+    } catch (err) {
+      return { ok: false, error: err.code || "activation_failed" };
+    }
+  });
+
+  ipcMain.handle("karate:retry-renewal", async () => {
+    return refreshLicenseState();
+  });
+
+  ipcMain.handle("karate:reset-license", async () => {
+    licensing.clearLicense({ userDataPath: app.getPath("userData") });
+    return refreshLicenseState();
+  });
+
   ipcMain.handle("karate:open-public-window", () => {
+    if (!canShowPublicWindow()) return false;
     createPublicWindow();
     return true;
   });
@@ -167,23 +283,17 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", async () => {
   if (process.platform !== "darwin") {
+    if (renewTimer) clearTimeout(renewTimer);
     if (serverHandle) {
-      try {
-        await serverHandle.stop();
-      } catch {
-        // ignore
-      }
+      try { await serverHandle.stop(); } catch { /* ignore */ }
     }
     app.quit();
   }
 });
 
 app.on("before-quit", async () => {
+  if (renewTimer) clearTimeout(renewTimer);
   if (serverHandle) {
-    try {
-      await serverHandle.stop();
-    } catch {
-      // ignore
-    }
+    try { await serverHandle.stop(); } catch { /* ignore */ }
   }
 });
