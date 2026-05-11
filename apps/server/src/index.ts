@@ -62,7 +62,7 @@ export async function createServer(
           plan: role,
           machineFingerprint: "kiosk-no-fp",
           activatedAt: Math.floor(Date.now() / 1000),
-          ttlSeconds: Math.floor((lc.expiresAt - Date.now()) / 1000),
+          ttlSeconds: lc.sessionTtlSeconds ?? Math.floor((lc.expiresAt - Date.now()) / 1000),
         }
       );
       kioskSession = {

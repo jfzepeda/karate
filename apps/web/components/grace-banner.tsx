@@ -26,11 +26,12 @@ export function GraceBanner() {
   }, []);
 
   useEffect(() => {
+    if (status.kind !== "authed" || !status.isGrace) return;
     const t = setInterval(() => {
       retryRenewal().catch((e) => setRetryError(e instanceof Error ? e.message : "renewal_failed"));
     }, 30_000);
     return () => clearInterval(t);
-  }, [retryRenewal]);
+  }, [retryRenewal, status]);
 
   if (status.kind !== "authed" || !status.isGrace) return null;
   // Recompute remaining locally so the countdown updates between IPC events.

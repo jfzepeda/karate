@@ -9,7 +9,7 @@
     "build:web": "cross-env KARATE_EXPORT=1 pnpm --filter @karate/web build",
     "afterPack:fuses": "node scripts/apply-fuses.js",
     "prepackage": "pnpm build:server && pnpm build:web",
-    "dev": "electron .",
+    "dev": "cross-env-shell ELECTRON_RUN_AS_NODE= \"electron .\"",
     "package": "pnpm prepackage && electron-builder",
     "package:mac": "pnpm prepackage && electron-builder --mac dmg",
     "package:win": "pnpm prepackage && electron-builder --win nsis",

@@ -52,6 +52,7 @@ export function buildRoutes(
     max: 5,
     key: (req) => clientIp(req),
     exponentialBackoff: true,
+    countOnlyFailures: true,
   });
 
   const renewLimiter = new RateLimiter({
@@ -152,11 +153,8 @@ export function buildRoutes(
       }
 
       if (record.used && !record.reclaimable) {
-        activateLimiter.recordFailure(req);
-        // Re-activation attempts where the original machine matches are
-        // allowed: this gives a fresh JWT to the same device (e.g. after a
-        // wipe of the local userData). Different machine → reject.
         if (record.machineFingerprint !== machineFingerprint) {
+          activateLimiter.recordFailure(req);
           logActivity(config.dataDir, {
             ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
             ip, machineFingerprint, jti: null, result: "fail", reason: "CODE_ALREADY_USED",
@@ -164,17 +162,6 @@ export function buildRoutes(
           res.status(409).json({ error: "CODE_ALREADY_USED" });
           return;
         }
-      }
-
-      if (licenses.isMachineRegisteredElsewhere(machineFingerprint, record.codeId)) {
-        activateLimiter.recordFailure(req);
-        logActivity(config.dataDir, {
-          ts: Date.now(), event: "ACTIVATION_FAILURE", userId: record.userId,
-          ip, machineFingerprint, jti: null, result: "fail",
-          reason: "MACHINE_ALREADY_REGISTERED",
-        });
-        res.status(409).json({ error: "MACHINE_ALREADY_REGISTERED" });
-        return;
       }
 
       const activatedAt = record.activatedAt ?? Math.floor(Date.now() / 1000);
@@ -615,10 +602,11 @@ export function buildRoutes(
 
   router.post("/api/prepare-download", auth, async (req: AuthedRequest, res: Response) => {
     const dataFile = loadData(config.dataDir);
+    const cfg = loadAppConfig(config.dataDir);
     const launchConfig = {
       issuedAt: Date.now(),
-      expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-      sessionTtlSeconds: JWT_TTL_SECONDS,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      sessionTtlSeconds: cfg.sessionTtlMinutes * 60,
       role: req.auth!.role,
       data: dataFile.data,
     };

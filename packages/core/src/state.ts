@@ -34,6 +34,7 @@ export function buildInitialState(): AppState {
     subcategorySize: 4,
     disciplineMode: "combat",
     areaCount: 1,
+    pointDifference: 8,
   };
   return {
     tournament: {
@@ -104,6 +105,9 @@ export function loadState(storage: Storage | null): AppState {
     }
     if (typeof parsed.tournament.settings.areaCount !== "number") {
       parsed.tournament.settings.areaCount = 1;
+    }
+    if (typeof parsed.tournament.settings.pointDifference === "undefined") {
+      parsed.tournament.settings.pointDifference = 8;
     }
     if (!parsed.tournament.areaAssignments || typeof parsed.tournament.areaAssignments !== "object") {
       parsed.tournament.areaAssignments = {};

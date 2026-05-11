@@ -62,6 +62,18 @@ export function TopTabs() {
       {tabs.map((t) => {
         const active = pathname.startsWith(t.href);
         if (t.external) {
+          if (isElectron()) {
+            return (
+              <button
+                key={t.href}
+                type="button"
+                className={`topbar-link${active ? " active" : ""}`}
+                onClick={() => (window.__KARATE__ as { openPublicWindow?: () => void })?.openPublicWindow?.()}
+              >
+                {t.label}
+              </button>
+            );
+          }
           return (
             <a
               key={t.href}

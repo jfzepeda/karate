@@ -150,8 +150,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setLicenseState(state);
         setToken(boot.token ?? null);
         license.onChange((envelope) => {
-          setLicenseState((envelope?.state ?? { kind: "unlicensed" }) as LicenseState);
-          setToken(envelope?.token ?? null);
+          const newState = (envelope?.state ?? { kind: "unlicensed" }) as LicenseState;
+          setLicenseState(newState);
+          // If the main process sends token:null while the license is still
+          // active/grace (e.g. a transient safeStorage read failure), keep the
+          // current token so the session isn't cleared spuriously.
+          setToken((prev) => {
+            const next = envelope?.token ?? null;
+            if (next !== null) return next;
+            if (newState.kind === "active" || newState.kind === "grace") return prev;
+            return null;
+          });
         });
         return;
       }

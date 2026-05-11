@@ -178,7 +178,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const id = setInterval(() => {
       if (typeof window === "undefined") return;
       if (!window.location.pathname.startsWith("/private")) return;
-      if (window.localStorage.getItem(TIMER_OWNER_KEY) !== TAB_ID) return;
+      // Claim ownership if unclaimed — handles Next.js pushState navigation which
+      // never fires popstate, so the separate ownership effect may not have run.
+      const owner = window.localStorage.getItem(TIMER_OWNER_KEY);
+      if (owner !== TAB_ID) {
+        if (owner !== null) return; // Another tab already owns it
+        window.localStorage.setItem(TIMER_OWNER_KEY, TAB_ID);
+      }
       const cur = stateRef.current;
       const t = cur.timer;
       if (!t.running || t.remaining <= 0) return;

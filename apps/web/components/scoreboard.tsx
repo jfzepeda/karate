@@ -39,7 +39,7 @@ export function Scoreboard({ state, variant }: Props) {
 
   const blue = (
     <div className="side blue">
-      <span className="role-tag">Blue · Azul</span>
+      <span className="role-tag">Blue · Ao</span>
       <div className={`name ${m.blueEliminated ? "eliminated" : ""}`}>
         {m.blueName || "—"}
       </div>

@@ -260,7 +260,8 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("karate:retry-renewal", async () => {
-    return refreshLicenseState();
+    await refreshLicenseState();
+    return { state: currentState, token: currentToken() };
   });
 
   ipcMain.handle("karate:reset-license", async () => {
