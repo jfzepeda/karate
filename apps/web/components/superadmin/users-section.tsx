@@ -52,7 +52,7 @@ export function UsersSection() {
     try {
       const r = await adminCreateLicense(token, {
         label: newLabel.trim(),
-        ttlDays: parseInt(newTtl, 10) || 30,
+        ttlMinutes: parseInt(newTtl, 10) || 43200,
       });
       setLastCode(r.code);
       setNewLabel("");

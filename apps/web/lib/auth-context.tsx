@@ -6,7 +6,7 @@ import {
 import type {
   AuthUser, Role, LicenseState, LicensePublic, LicenseDegradedReason,
 } from "@karate/core";
-import { apiActivate, apiRenewToken } from "./api-client";
+import { apiActivate, apiRenewToken, apiMe, ApiError } from "./api-client";
 
 /**
  * License-aware auth context. Replaces the old username/password AuthProvider.
@@ -203,6 +203,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setStatus(statusFromState(licenseState, token));
   }, [licenseState, token]);
+
+  // Heartbeat — detect revocation within 30 s without waiting for renewal.
+  useEffect(() => {
+    if (!token || isKioskRef.current) return;
+    const check = async () => {
+      try {
+        await apiMe(token);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          const license = (typeof window !== "undefined" ? window.__KARATE__?.license : null);
+          if (license) {
+            const envelope = await license.retryRenewal().catch(() => null);
+            setLicenseState((envelope?.state ?? { kind: "unlicensed" }) as LicenseState);
+            setToken(envelope?.token ?? null);
+          } else {
+            clearSessionToken();
+            setToken(null);
+            setLicenseState({ kind: "unlicensed" });
+          }
+        }
+      }
+    };
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, [token]);
 
   // ------- Actions -------
   const login = useCallback(async (code: string): Promise<AuthUser> => {

@@ -59,7 +59,7 @@ export async function adminGetLicenses(token: string): Promise<{ licenses: Licen
 export async function adminCreateLicense(token: string, body: {
   features?: Feature[];
   label: string;
-  ttlDays?: number;
+  ttlMinutes?: number;
 }): Promise<{ code: string; userId: string; label: string; role: Role; features: Feature[]; expiresAt: number }> {
   return request("/api/admin/licenses", { token, method: "POST", body });
 }
@@ -72,9 +72,9 @@ export async function adminTransferLicense(token: string, userId: string): Promi
   return request(`/api/admin/licenses/${encodeURIComponent(userId)}/transfer`, { token, method: "POST" });
 }
 
-export async function adminExtendLicense(token: string, userId: string, days: number): Promise<{ ok: true; expiresAt: number }> {
+export async function adminExtendLicense(token: string, userId: string, minutes: number): Promise<{ ok: true; expiresAt: number }> {
   return request(`/api/admin/licenses/${encodeURIComponent(userId)}/extend`, {
-    token, method: "POST", body: { days },
+    token, method: "POST", body: { minutes },
   });
 }
 

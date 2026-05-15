@@ -89,18 +89,7 @@ export class LicenseStore {
   }
 
   private persist(): void {
-    // Defensive: strip rawCodeMemoryOnly before writing.
-    const snapshot: LicensesFile = {
-      version: FILE_VERSION,
-      codes: Object.fromEntries(
-        Object.entries(this.file.codes).map(([k, v]) => [
-          k,
-          { ...v, rawCodeMemoryOnly: null },
-        ])
-      ),
-      revokedJtis: this.file.revokedJtis,
-    };
-    writeJson(filePath(this.dataDir), snapshot);
+    writeJson(filePath(this.dataDir), this.file);
   }
 
   /** Create a new unused claim code. Returns the raw 6-digit value so the
@@ -287,17 +276,13 @@ export class LicenseStore {
    *  preview/metadata only. */
   list(): LicenseCodeRecord[] {
     const now = Date.now();
-    return Object.values(this.file.codes).map((r) => {
-      const status: LicenseCodeRecord["status"] = r.revoked
-        ? "revoked"
-        : r.used
-          ? "active"
-          : r.expiresAt < now
-            ? "expired"
-            : "unused";
+    return Object.values(this.file.codes)
+      .filter((r) => !r.revoked && r.expiresAt >= now)
+      .map((r) => {
+      const status: LicenseCodeRecord["status"] = r.used ? "active" : "unused";
       return {
-        code: "",
-        codePreview: "**" + r.codeId.slice(0, 2),
+        code: r.rawCodeMemoryOnly ?? "",
+        codePreview: r.rawCodeMemoryOnly ? r.rawCodeMemoryOnly : "**" + r.codeId.slice(0, 2),
         userId: r.userId,
         role: r.role,
         features: r.features,

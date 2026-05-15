@@ -14,6 +14,7 @@ import {
 
 interface OverlayApi {
   isOpen: boolean;
+  isListening: boolean;
   getLocalAdminToken: () => string | null;
   requestClose: () => Promise<void>;
 }
@@ -22,6 +23,7 @@ const OverlayContext = createContext<OverlayApi | null>(null);
 
 export function OverlayProvider({ children }: { children: React.ReactNode }) {
   const [isOpen, setIsOpen] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const tokenRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -30,13 +32,18 @@ export function OverlayProvider({ children }: { children: React.ReactNode }) {
     if (!overlay) return;
     const offOpen = overlay.onOpen((payload) => {
       tokenRef.current = payload?.localAdminToken ?? null;
+      setIsListening(false);
       setIsOpen(true);
     });
     const offClose = overlay.onClose(() => {
       tokenRef.current = null;
       setIsOpen(false);
     });
-    return () => { offOpen(); offClose(); };
+    const offListening = overlay.onListening?.(() => {
+      setIsListening(true);
+      setTimeout(() => setIsListening(false), 5000);
+    }) ?? (() => {});
+    return () => { offOpen(); offClose(); offListening(); };
   }, []);
 
   const requestClose = useCallback(async () => {
@@ -50,9 +57,10 @@ export function OverlayProvider({ children }: { children: React.ReactNode }) {
 
   const api: OverlayApi = useMemo(() => ({
     isOpen,
+    isListening,
     getLocalAdminToken: () => tokenRef.current,
     requestClose,
-  }), [isOpen, requestClose]);
+  }), [isOpen, isListening, requestClose]);
 
   return <OverlayContext.Provider value={api}>{children}</OverlayContext.Provider>;
 }

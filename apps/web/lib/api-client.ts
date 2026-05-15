@@ -78,6 +78,7 @@ declare global {
       overlay?: {
         onOpen(cb: (payload: { localAdminToken: string; serverUrl: string }) => void): () => void;
         onClose(cb: () => void): () => void;
+        onListening?: (cb: () => void) => () => void;
         requestClose(): Promise<{ ok: boolean }>;
       };
       network?: {

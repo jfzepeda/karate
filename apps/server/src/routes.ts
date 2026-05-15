@@ -166,6 +166,7 @@ export function buildRoutes(
       }
 
       const activatedAt = record.activatedAt ?? Math.floor(Date.now() / 1000);
+      const secondsUntilExpiry = Math.floor((record.expiresAt - Date.now()) / 1000);
       const { token, payload } = await signLicenseToken(deps, {
         userId: record.userId,
         role: record.role,
@@ -173,6 +174,7 @@ export function buildRoutes(
         plan: record.plan,
         machineFingerprint,
         activatedAt,
+        ttlSeconds: Math.min(JWT_TTL_SECONDS, Math.max(60, secondsUntilExpiry)),
       });
       licenses.activate(record.codeId, machineFingerprint, payload.jti);
 
@@ -262,6 +264,15 @@ export function buildRoutes(
         logActivity(config.dataDir, {
           ts: Date.now(), event: "RENEWAL_REJECTED_REVOKED", userId: sub,
           ip, machineFingerprint, jti, result: "fail", reason: "ACCESS_REVOKED",
+        });
+        res.status(401).json({ error: "ACCESS_REVOKED" });
+        return;
+      }
+
+      if (record.expiresAt < Date.now()) {
+        logActivity(config.dataDir, {
+          ts: Date.now(), event: "RENEWAL_REJECTED_REVOKED", userId: sub,
+          ip, machineFingerprint, jti, result: "fail", reason: "CODE_EXPIRED",
         });
         res.status(401).json({ error: "ACCESS_REVOKED" });
         return;
@@ -477,14 +488,14 @@ export function buildRoutes(
     (req: Request, res: Response) => {
       const body = (req.body ?? {}) as {
         features?: Feature[]; label?: string;
-        ttlDays?: number; plan?: string;
+        ttlMinutes?: number; plan?: string;
       };
       const role: Role = "referee";
       const features = Array.isArray(body.features) && body.features.length
         ? body.features
         : FEATURE_PRESETS[role];
       const label = (body.label ?? "").trim() || `${role}-${Date.now()}`;
-      const ttlMs = Math.max(1, Number(body.ttlDays ?? 30)) * 24 * 60 * 60 * 1000;
+      const ttlMs = Math.max(1, Number(body.ttlMinutes ?? 43200)) * 60 * 1000;
       const plan = body.plan ?? role;
       const { code, record } = licenses.createCode({
         role, features, label, ttlMs, plan,
@@ -532,16 +543,16 @@ export function buildRoutes(
     "/api/admin/licenses/:userId/extend",
     localAdmin,
     (req: Request, res: Response) => {
-      const days = Math.max(1, Number((req.body ?? {}).days ?? 30));
+      const minutes = Math.max(1, Number((req.body ?? {}).minutes ?? 43200));
       const codeId = licenses.findCodeIdByUserId(req.params.userId);
       if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
-      const newExpiry = Date.now() + days * 24 * 60 * 60 * 1000;
+      const newExpiry = Date.now() + minutes * 60 * 1000;
       const ok = licenses.extendExpiry(codeId, newExpiry);
       if (!ok) { res.status(409).json({ error: "already_redeemed" }); return; }
       logActivity(config.dataDir, {
         ts: Date.now(), event: "LICENSE_EXTEND", userId: req.params.userId,
         ip: clientIp(req), jti: null, result: "success",
-        message: `+${days}d`,
+        message: `+${minutes}min`,
       });
       res.json({ ok: true, expiresAt: newExpiry });
     }

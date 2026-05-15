@@ -15,7 +15,6 @@ export interface ServerConfig {
   port: number;
   staticDir?: string | null;
   launchConfig?: LaunchConfig | null;
-  /** Test claim codes seeded on first boot. See passwords.txt. */
   seedClaimCodes: Array<{ code: string; role: Role; features: Feature[]; label: string }>;
 }
 
@@ -42,14 +41,7 @@ export function defaultConfig(overrides: Partial<ServerConfig> = {}): ServerConf
     port: overrides.port ?? Number(process.env.KARATE_PORT ?? 47291),
     staticDir: overrides.staticDir ?? null,
     launchConfig: overrides.launchConfig ?? null,
-    seedClaimCodes: overrides.seedClaimCodes ?? [
-      // All seeds are referee-only. Superadmin access is granted exclusively
-      // via the local stealth chord on the desktop client.
-      { code: "305847", role: "referee", features: FULL_REFEREE, label: "Test Referee 1" },
-      { code: "671234", role: "referee", features: FULL_REFEREE, label: "Test Referee 2" },
-      { code: "918273", role: "referee", features: FULL_REFEREE, label: "Test Referee 3" },
-      { code: "774410", role: "referee", features: FULL_REFEREE, label: "Unassigned spare" },
-    ],
+    seedClaimCodes: overrides.seedClaimCodes ?? [],
   };
 }
 

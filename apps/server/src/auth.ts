@@ -105,6 +105,11 @@ export function requireAuth(deps: AuthDeps) {
       res.status(401).json({ error: "ACCESS_REVOKED" });
       return;
     }
+    const record = deps.licenses.findByUserId(payload.sub);
+    if (record && record.expiresAt < Date.now()) {
+      res.status(401).json({ error: "ACCESS_REVOKED" });
+      return;
+    }
     req.auth = payload;
     next();
   };

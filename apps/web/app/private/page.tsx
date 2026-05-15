@@ -74,7 +74,7 @@ export default function PrivatePage() {
           <button className="red-btn" onClick={() => eliminate("red")}>
             ✕ Eliminate Red
           </button>
-          <button className="danger" onClick={resetScoreboard}>
+          <button className="danger" onClick={() => resetScoreboard()}>
             Reset Scoreboard
           </button>
         </div>

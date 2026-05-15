@@ -78,7 +78,8 @@ interface StoreApi {
   applyTournamentSettings: (
     size: SubcategorySize,
     mode: DisciplineMode,
-    pointDiff: number
+    pointDiff: number,
+    skipConfirm?: boolean
   ) => boolean;
   replaceParticipants: (list: Omit<Participant, "id">[]) => void;
   addParticipant: (p: Omit<Participant, "id">) => void;
@@ -86,13 +87,13 @@ interface StoreApi {
   setCategoryDefs: (defs: CategoryDef[]) => void;
   addCategoryDef: (def: CategoryDef) => void;
   updateCategoryDef: (def: CategoryDef) => void;
-  removeCategoryDef: (id: string) => void;
-  reseed: (seed?: number) => void;
+  removeCategoryDef: (id: string, skipConfirm?: boolean) => void;
+  reseed: (seed?: number, skipConfirm?: boolean) => void;
   setAreaCount: (n: number) => void;
   assignSubcategoryToArea: (subcategoryId: string, areaIndex: number) => void;
   setLogoUrl: (url: string | null) => void;
-  loadMockTournament: () => void;
-  resetScoreboard: () => void;
+  loadMockTournament: (skipConfirm?: boolean) => void;
+  resetScoreboard: (skipConfirm?: boolean) => void;
   eliminate: (side: "blue" | "red") => void;
   addPoints: (side: "blue" | "red", n: number) => void;
   setAdvantage: (side: "blue" | "red", value: boolean) => void;
@@ -329,7 +330,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const ref = s.match.activeMatchRef;
         const threshold = s.tournament.settings.pointDifference ?? 0;
         if (ref && s.match.discipline === "combat" && threshold > 0) {
-          const winnerSide = computeCombatWinner(s.match, threshold);
+          const diff = s.match.bluePoints - s.match.redPoints;
+          const winnerSide: "blue" | "red" | null =
+            diff >= threshold ? "blue" : -diff >= threshold ? "red" : null;
           if (winnerSide) {
             s.timer.running = false;
             const winnerName = winnerSide === "blue" ? s.match.blueName : s.match.redName;
@@ -469,11 +472,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           sendNamed(Actions.resolveJury(chosenName));
         }
       },
-      applyTournamentSettings: (size, mode_, pointDiff) => {
+      applyTournamentSettings: (size, mode_, pointDiff, skipConfirm) => {
         const cur = stateRef.current.tournament.settings;
         const structureChanged = cur.subcategorySize !== size || cur.disciplineMode !== mode_;
         if (!structureChanged && cur.pointDifference === pointDiff) return false;
         const ok = !structureChanged ||
+          skipConfirm ||
           (typeof window !== "undefined" ? window.confirm("This will reset all bracket progress. Continue?") : true);
         if (!ok) return false;
         update((s) => {
@@ -494,18 +498,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setCategoryDefs: (defs) => update((s) => setCategoryDefsImpl(s, defs)),
       addCategoryDef: (def) => update((s) => addCategoryDefImpl(s, def)),
       updateCategoryDef: (def) => update((s) => updateCategoryDefImpl(s, def)),
-      removeCategoryDef: (id) => {
-        const ok = typeof window !== "undefined"
-          ? window.confirm("Delete this category definition? Participants matching this definition will become unassigned until you create a new one.")
-          : true;
+      removeCategoryDef: (id, skipConfirm) => {
+        const ok = skipConfirm ||
+          (typeof window !== "undefined"
+            ? window.confirm("Delete this category definition? Participants matching this definition will become unassigned until you create a new one.")
+            : true);
         if (!ok) return;
         update((s) => removeCategoryDefImpl(s, id));
       },
-      reseed: (seed) => {
+      reseed: (seed, skipConfirm) => {
         if (typeof seed !== "number") {
-          const ok = typeof window !== "undefined"
-            ? window.confirm("This will reset all bracket progress and reassign all competitors randomly. Continue?")
-            : true;
+          const ok = skipConfirm ||
+            (typeof window !== "undefined"
+              ? window.confirm("This will reset all bracket progress and reassign all competitors randomly. Continue?")
+              : true);
           if (!ok) return;
         }
         update((s) => { reseedImpl(s, seed); });
@@ -513,10 +519,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setAreaCount: (n) => update((s) => setAreaCountImpl(s, n)),
       assignSubcategoryToArea: (subId, areaIdx) => update((s) => assignSubcategoryToAreaImpl(s, subId, areaIdx)),
       setLogoUrl: (url) => update((s) => setLogoUrlImpl(s, url)),
-      loadMockTournament: () => {
-        const ok = typeof window !== "undefined"
-          ? window.confirm("Replace the current participants and category definitions with the demo tournament?")
-          : true;
+      loadMockTournament: (skipConfirm) => {
+        const ok = skipConfirm ||
+          (typeof window !== "undefined"
+            ? window.confirm("Replace the current participants and category definitions with the demo tournament?")
+            : true);
         if (!ok) return;
         update((s) => {
           const mock = generateMockTournament();
@@ -524,10 +531,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           replaceParticipantsImpl(s, mock.participants.map(({ id: _id, ...rest }) => rest));
         });
       },
-      resetScoreboard: () => {
-        const ok = typeof window !== "undefined"
-          ? window.confirm("Reset the scoreboard? All current values will be cleared.")
-          : true;
+      resetScoreboard: (skipConfirm) => {
+        const ok = skipConfirm ||
+          (typeof window !== "undefined"
+            ? window.confirm("Reset the scoreboard? All current values will be cleared.")
+            : true);
         if (!ok) return;
         if (mode === "standalone") {
           updateLocal((s) => resetLiveScoreboard(s));

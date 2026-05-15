@@ -53,6 +53,57 @@ pnpm install
 pnpm --filter @karate/desktop dev          # spawns Electron + bundled server
 ```
 
+> **⚠ Importante — flujo de cambios en desktop:**
+> `pnpm dev` en desktop solo reconstruye `@karate/core`. El web y el servidor
+> se sirven desde builds anteriores. Cada vez que cambies código, corre el paso
+> correspondiente **antes** de (re)abrir la app:
+>
+> | Cambiaste… | Comando a correr primero |
+> |---|---|
+> | `apps/web/**` o `packages/core/**` | `pnpm --filter @karate/desktop build:web` |
+> | `apps/server/**` | `pnpm --filter @karate/desktop build:server` |
+> | `packages/core/**` (sin web) | `pnpm --filter @karate/desktop build:core` |
+> | Todo (antes de empaquetar) | `pnpm --filter @karate/desktop prepackage` |
+>
+> Si estás corriendo el `.app` empaquetado, además de los pasos anteriores hay
+> que actualizar el bundle manualmente o reempaquetar (ver "Actualizar .app sin
+> reempaquetar" más abajo).
+
+### Sincronización LAN entre computadoras (modo Server / Client)
+
+La app de escritorio tiene sincronización en red local. Una máquina actúa como
+**Server** (posee el estado) y las demás como **Client** (se auto-descubren vía
+UDP broadcast y se sincronizan por WebSocket).
+
+**Requisito previo:** ambas máquinas deben tener la app corriendo y estar en la
+misma red Wi-Fi o LAN.
+
+#### Primera vez (build completo)
+
+```bash
+pnpm install
+
+# Desde apps/desktop — construye todo antes de arrancar
+pnpm --filter @karate/desktop build:server
+pnpm --filter @karate/desktop build:core
+pnpm --filter @karate/desktop build:web
+
+pnpm --filter @karate/desktop dev
+```
+
+O de una sola vez con el alias ya definido:
+
+```bash
+pnpm --filter @karate/desktop prepackage && pnpm --filter @karate/desktop dev
+```
+
+#### Conectarse en red
+
+1. En la máquina **principal**: Panel de red → cambiar modo a **Server**.
+2. En cada **otra máquina**: cambiar modo a **Client** — se auto-descubre y conecta sola.
+
+No se necesita el `.dmg` para desarrollo; `pnpm dev` en la misma red es suficiente.
+
 To produce installers:
 
 ```bash
@@ -61,6 +112,26 @@ pnpm --filter @karate/desktop package:mac  # .dmg
 pnpm --filter @karate/desktop package:win  # .exe (NSIS)
 pnpm --filter @karate/desktop package:linux # .AppImage
 ```
+
+### Actualizar el .app empaquetado sin reempaquetar
+
+Útil para probar cambios rápidos sin esperar el build completo:
+
+```bash
+APP="/path/to/dist-electron/mac/Karate Tournament.app/Contents/Resources"
+
+# 1. Reconstruir web
+pnpm --filter @karate/desktop build:web
+
+# 2. Copiar renderer al bundle
+rm -rf "$APP/renderer" && cp -r apps/web/out "$APP/renderer"
+
+# 3. Si cambiaste el servidor: reconstruir y copiar
+pnpm --filter @karate/desktop build:server
+rm -rf "$APP/server" && cp -r apps/desktop/dist-server "$APP/server"
+```
+
+Después cierra y reabre el `.app`.
 
 The desktop wrapper:
 

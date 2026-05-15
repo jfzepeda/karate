@@ -20,16 +20,19 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 
 export function requireLocalAdmin(getToken: () => string | null) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (!isLoopback(req)) {
+    const ip = req.socket.remoteAddress ?? "";
+    const loop = LOOPBACK.has(ip);
+    const expected = getToken();
+    const provided = req.headers[HEADER];
+    console.log(`[local-admin] ip=${ip} loopback=${loop} expected=${expected?.slice(0,8)} provided=${typeof provided === "string" ? provided.slice(0,8) : provided}`);
+    if (!loop) {
       res.status(401).json({ error: "local_admin_required" });
       return;
     }
-    const expected = getToken();
     if (!expected) {
       res.status(401).json({ error: "local_admin_required" });
       return;
     }
-    const provided = req.headers[HEADER];
     if (typeof provided !== "string" || !timingSafeEqualStr(provided, expected)) {
       res.status(401).json({ error: "local_admin_required" });
       return;
