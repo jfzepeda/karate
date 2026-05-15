@@ -35005,14 +35005,7 @@ function defaultConfig(overrides = {}) {
     port: overrides.port ?? Number(process.env.KARATE_PORT ?? 47291),
     staticDir: overrides.staticDir ?? null,
     launchConfig: overrides.launchConfig ?? null,
-    seedClaimCodes: overrides.seedClaimCodes ?? [
-      // All seeds are referee-only. Superadmin access is granted exclusively
-      // via the local stealth chord on the desktop client.
-      { code: "305847", role: "referee", features: FULL_REFEREE, label: "Test Referee 1" },
-      { code: "671234", role: "referee", features: FULL_REFEREE, label: "Test Referee 2" },
-      { code: "918273", role: "referee", features: FULL_REFEREE, label: "Test Referee 3" },
-      { code: "774410", role: "referee", features: FULL_REFEREE, label: "Unassigned spare" }
-    ]
+    seedClaimCodes: overrides.seedClaimCodes ?? []
   };
 }
 var FEATURE_PRESETS = {
@@ -35154,6 +35147,11 @@ function requireAuth(deps) {
       res.status(401).json({ error: "ACCESS_REVOKED" });
       return;
     }
+    const record = deps.licenses.findByUserId(payload.sub);
+    if (record && record.expiresAt < Date.now()) {
+      res.status(401).json({ error: "ACCESS_REVOKED" });
+      return;
+    }
     req.auth = payload;
     next();
   };
@@ -35163,10 +35161,6 @@ function requireAuth(deps) {
 var crypto5 = __toESM(require("crypto"));
 var LOOPBACK = /* @__PURE__ */ new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 var HEADER = "x-karate-local-admin";
-function isLoopback(req) {
-  const ip = req.socket.remoteAddress ?? "";
-  return LOOPBACK.has(ip);
-}
 function timingSafeEqualStr(a, b) {
   if (a.length !== b.length) return false;
   try {
@@ -35177,16 +35171,19 @@ function timingSafeEqualStr(a, b) {
 }
 function requireLocalAdmin(getToken) {
   return (req, res, next) => {
-    if (!isLoopback(req)) {
+    const ip = req.socket.remoteAddress ?? "";
+    const loop = LOOPBACK.has(ip);
+    const expected = getToken();
+    const provided = req.headers[HEADER];
+    console.log(`[local-admin] ip=${ip} loopback=${loop} expected=${expected?.slice(0, 8)} provided=${typeof provided === "string" ? provided.slice(0, 8) : provided}`);
+    if (!loop) {
       res.status(401).json({ error: "local_admin_required" });
       return;
     }
-    const expected = getToken();
     if (!expected) {
       res.status(401).json({ error: "local_admin_required" });
       return;
     }
-    const provided = req.headers[HEADER];
     if (typeof provided !== "string" || !timingSafeEqualStr(provided, expected)) {
       res.status(401).json({ error: "local_admin_required" });
       return;
@@ -35968,13 +35965,15 @@ function buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken = 
         }
       }
       const activatedAt = record.activatedAt ?? Math.floor(Date.now() / 1e3);
+      const secondsUntilExpiry = Math.floor((record.expiresAt - Date.now()) / 1e3);
       const { token, payload } = await signLicenseToken(deps, {
         userId: record.userId,
         role: record.role,
         features: record.features,
         plan: record.plan,
         machineFingerprint,
-        activatedAt
+        activatedAt,
+        ttlSeconds: Math.min(JWT_TTL_SECONDS, Math.max(60, secondsUntilExpiry))
       });
       licenses.activate(record.codeId, machineFingerprint, payload.jti);
       activateLimiter.recordSuccess(req);
@@ -36062,6 +36061,20 @@ function buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken = 
           jti,
           result: "fail",
           reason: "ACCESS_REVOKED"
+        });
+        res.status(401).json({ error: "ACCESS_REVOKED" });
+        return;
+      }
+      if (record.expiresAt < Date.now()) {
+        logActivity(config.dataDir, {
+          ts: Date.now(),
+          event: "RENEWAL_REJECTED_REVOKED",
+          userId: sub,
+          ip,
+          machineFingerprint,
+          jti,
+          result: "fail",
+          reason: "CODE_EXPIRED"
         });
         res.status(401).json({ error: "ACCESS_REVOKED" });
         return;
@@ -36264,7 +36277,7 @@ function buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken = 
       const role = "referee";
       const features = Array.isArray(body.features) && body.features.length ? body.features : FEATURE_PRESETS[role];
       const label = (body.label ?? "").trim() || `${role}-${Date.now()}`;
-      const ttlMs = Math.max(1, Number(body.ttlDays ?? 30)) * 24 * 60 * 60 * 1e3;
+      const ttlMs = Math.max(1, Number(body.ttlMinutes ?? 43200)) * 60 * 1e3;
       const plan = body.plan ?? role;
       const { code, record } = licenses.createCode({
         role,
@@ -36331,13 +36344,13 @@ function buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken = 
     "/api/admin/licenses/:userId/extend",
     localAdmin,
     (req, res) => {
-      const days = Math.max(1, Number((req.body ?? {}).days ?? 30));
+      const minutes = Math.max(1, Number((req.body ?? {}).minutes ?? 43200));
       const codeId = licenses.findCodeIdByUserId(req.params.userId);
       if (!codeId) {
         res.status(404).json({ error: "not_found" });
         return;
       }
-      const newExpiry = Date.now() + days * 24 * 60 * 60 * 1e3;
+      const newExpiry = Date.now() + minutes * 60 * 1e3;
       const ok = licenses.extendExpiry(codeId, newExpiry);
       if (!ok) {
         res.status(409).json({ error: "already_redeemed" });
@@ -36350,7 +36363,7 @@ function buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken = 
         ip: clientIp(req),
         jti: null,
         result: "success",
-        message: `+${days}d`
+        message: `+${minutes}min`
       });
       res.json({ ok: true, expiresAt: newExpiry });
     }
@@ -36536,17 +36549,7 @@ var LicenseStore = class {
   }
   file;
   persist() {
-    const snapshot = {
-      version: FILE_VERSION2,
-      codes: Object.fromEntries(
-        Object.entries(this.file.codes).map(([k, v]) => [
-          k,
-          { ...v, rawCodeMemoryOnly: null }
-        ])
-      ),
-      revokedJtis: this.file.revokedJtis
-    };
-    writeJson(filePath(this.dataDir), snapshot);
+    writeJson(filePath(this.dataDir), this.file);
   }
   /** Create a new unused claim code. Returns the raw 6-digit value so the
    *  superadmin can display it once. Subsequent reads return only metadata. */
@@ -36706,11 +36709,11 @@ var LicenseStore = class {
    *  preview/metadata only. */
   list() {
     const now = Date.now();
-    return Object.values(this.file.codes).map((r) => {
-      const status = r.revoked ? "revoked" : r.used ? "active" : r.expiresAt < now ? "expired" : "unused";
+    return Object.values(this.file.codes).filter((r) => !r.revoked && r.expiresAt >= now).map((r) => {
+      const status = r.used ? "active" : "unused";
       return {
-        code: "",
-        codePreview: "**" + r.codeId.slice(0, 2),
+        code: r.rawCodeMemoryOnly ?? "",
+        codePreview: r.rawCodeMemoryOnly ? r.rawCodeMemoryOnly : "**" + r.codeId.slice(0, 2),
         userId: r.userId,
         role: r.role,
         features: r.features,

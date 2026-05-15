@@ -33,14 +33,25 @@ let state = "IDLE";
 let listenIdx = 0;
 let listenTimer = null;
 let debounceTimer = null;
+let got3Timer = null;
 const pressed = new Set();
 let overlayOpen = false;
-let callbacks = { onOpen: () => {}, onClose: () => {} };
+let callbacks = { onOpen: () => {}, onClose: () => {}, onListening: () => {} };
+
+function enterListening() {
+  state = "LISTENING";
+  listenIdx = 0;
+  pressed.clear();
+  if (listenTimer) clearTimeout(listenTimer);
+  listenTimer = setTimeout(() => { reset(); }, LISTEN_WINDOW_MS);
+  try { callbacks.onListening(); } catch { /* ignore */ }
+}
 
 function reset() {
   state = "IDLE";
   listenIdx = 0;
   if (listenTimer) { clearTimeout(listenTimer); listenTimer = null; }
+  if (got3Timer) { clearTimeout(got3Timer); got3Timer = null; }
 }
 
 function enterDebounce() {
@@ -57,7 +68,7 @@ function isDigit(input, n) {
 }
 
 function ctrlHeld(input) {
-  return input.control === true || input.key === "Control";
+  return input.meta === true || input.key === "Meta";
 }
 
 function handle(event, input) {
@@ -82,17 +93,12 @@ function handle(event, input) {
 
   if (input.type === "keyUp") {
     if (state === "GOT_3" && pressed.size === 0) {
-      // All keys released after Ctrl+1+2+3 — fire the transition.
+      if (got3Timer) { clearTimeout(got3Timer); got3Timer = null; }
       if (overlayOpen) {
         enterDebounce();
         try { callbacks.onClose(); } catch { /* ignore */ }
       } else {
-        state = "LISTENING";
-        listenIdx = 0;
-        if (listenTimer) clearTimeout(listenTimer);
-        listenTimer = setTimeout(() => {
-          reset();
-        }, LISTEN_WINDOW_MS);
+        enterListening();
       }
       return;
     }
@@ -100,7 +106,7 @@ function handle(event, input) {
     // wait for the pressed set to be empty before resetting.
     if (
       (state === "CTRL_DOWN" || state === "GOT_1" || state === "GOT_2") &&
-      !pressed.has("ControlLeft") && !pressed.has("ControlRight")
+      !pressed.has("MetaLeft") && !pressed.has("MetaRight")
     ) {
       reset();
     }
@@ -111,13 +117,13 @@ function handle(event, input) {
 
   switch (state) {
     case "IDLE": {
-      if (input.key === "Control") {
+      if (input.key === "Meta") {
         state = "CTRL_DOWN";
       }
       return;
     }
     case "CTRL_DOWN": {
-      if (input.key === "Control") return; // second Ctrl key
+      if (input.key === "Meta") return; // second Meta key
       if (ctrlHeld(input) && isDigit(input, 1)) {
         event.preventDefault();
         state = "GOT_1";
@@ -131,7 +137,7 @@ function handle(event, input) {
       return;
     }
     case "GOT_1": {
-      if (input.key === "Control") return;
+      if (input.key === "Meta") return;
       if (ctrlHeld(input) && isDigit(input, 2)) {
         event.preventDefault();
         state = "GOT_2";
@@ -144,10 +150,22 @@ function handle(event, input) {
       return;
     }
     case "GOT_2": {
-      if (input.key === "Control") return;
+      if (input.key === "Meta") return;
       if (ctrlHeld(input) && isDigit(input, 3)) {
         event.preventDefault();
         state = "GOT_3";
+        if (got3Timer) clearTimeout(got3Timer);
+        got3Timer = setTimeout(() => {
+          got3Timer = null;
+          if (state === "GOT_3") {
+            if (overlayOpen) {
+              enterDebounce();
+              try { callbacks.onClose(); } catch { /* ignore */ }
+            } else {
+              enterListening();
+            }
+          }
+        }, 400);
         return;
       }
       reset();
@@ -209,6 +227,7 @@ function attach(webContents) {
 function init(opts = {}) {
   if (typeof opts.onOpen === "function") callbacks.onOpen = opts.onOpen;
   if (typeof opts.onClose === "function") callbacks.onClose = opts.onClose;
+  if (typeof opts.onListening === "function") callbacks.onListening = opts.onListening;
 }
 
 function setOverlayOpen(open) {

@@ -215,6 +215,12 @@ function createPublicWindow() {
   return publicWindow;
 }
 
+function emitChordListening() {
+  console.log("[karate] chord LISTENING activo");
+  if (!primaryWindow || primaryWindow.isDestroyed()) return;
+  primaryWindow.webContents.send("karate:chord-listening");
+}
+
 function emitOverlayOpen() {
   if (!primaryWindow || primaryWindow.isDestroyed()) return;
   try { primaryWindow.focus(); } catch { /* ignore */ }
@@ -235,7 +241,7 @@ function emitOverlayClose() {
 app.whenReady().then(async () => {
   try {
     localAdminToken.init();
-    stealthChord.init({ onOpen: emitOverlayOpen, onClose: emitOverlayClose });
+    stealthChord.init({ onOpen: emitOverlayOpen, onClose: emitOverlayClose, onListening: emitChordListening });
     await startServer();
     machineFp = licensing.getMachineFingerprint(app.getPath("userData"));
     licensingUrl = process.env.KARATE_LICENSING_URL || serverUrl;

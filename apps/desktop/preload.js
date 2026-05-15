@@ -33,6 +33,7 @@ ipcRenderer.on("karate:license-state", (_evt, envelope) => {
 
 const overlayOpenListeners = new Set();
 const overlayCloseListeners = new Set();
+const chordListeningListeners = new Set();
 ipcRenderer.on("karate:overlay-open", (_evt, payload) => {
   for (const cb of overlayOpenListeners) {
     try { cb(payload); } catch { /* ignore */ }
@@ -40,6 +41,11 @@ ipcRenderer.on("karate:overlay-open", (_evt, payload) => {
 });
 ipcRenderer.on("karate:overlay-close", () => {
   for (const cb of overlayCloseListeners) {
+    try { cb(); } catch { /* ignore */ }
+  }
+});
+ipcRenderer.on("karate:chord-listening", () => {
+  for (const cb of chordListeningListeners) {
     try { cb(); } catch { /* ignore */ }
   }
 });
@@ -110,6 +116,10 @@ contextBridge.exposeInMainWorld("__KARATE__", {
     onClose(cb) {
       overlayCloseListeners.add(cb);
       return () => overlayCloseListeners.delete(cb);
+    },
+    onListening(cb) {
+      chordListeningListeners.add(cb);
+      return () => chordListeningListeners.delete(cb);
     },
     requestClose() {
       return ipcRenderer.invoke("karate:overlay-close-request");
