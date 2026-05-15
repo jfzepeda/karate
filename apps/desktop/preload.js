@@ -31,6 +31,41 @@ ipcRenderer.on("karate:license-state", (_evt, envelope) => {
   }
 });
 
+const overlayOpenListeners = new Set();
+const overlayCloseListeners = new Set();
+ipcRenderer.on("karate:overlay-open", (_evt, payload) => {
+  for (const cb of overlayOpenListeners) {
+    try { cb(payload); } catch { /* ignore */ }
+  }
+});
+ipcRenderer.on("karate:overlay-close", () => {
+  for (const cb of overlayCloseListeners) {
+    try { cb(); } catch { /* ignore */ }
+  }
+});
+
+function makeFanout() { return new Set(); }
+const netStateListeners = makeFanout();
+const netStatusListeners = makeFanout();
+const netAckListeners = makeFanout();
+const netRejectedListeners = makeFanout();
+const netRivalListeners = makeFanout();
+ipcRenderer.on("karate:network-state", (_evt, payload) => {
+  for (const cb of netStateListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-status", (_evt, payload) => {
+  for (const cb of netStatusListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-action-ack", (_evt, payload) => {
+  for (const cb of netAckListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-action-rejected", (_evt, payload) => {
+  for (const cb of netRejectedListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-rival-server", (_evt, payload) => {
+  for (const cb of netRivalListeners) { try { cb(payload); } catch {} }
+});
+
 contextBridge.exposeInMainWorld("__KARATE__", {
   isElectron: true,
   serverUrl,
@@ -62,5 +97,53 @@ contextBridge.exposeInMainWorld("__KARATE__", {
 
   openPublicWindow() {
     return ipcRenderer.invoke("karate:open-public-window");
+  },
+
+  // Configuration overlay surface. The renderer cannot trigger overlay
+  // open — only the main-process chord detector can. The renderer may
+  // request a programmatic close (e.g. after an unrecoverable error).
+  overlay: {
+    onOpen(cb) {
+      overlayOpenListeners.add(cb);
+      return () => overlayOpenListeners.delete(cb);
+    },
+    onClose(cb) {
+      overlayCloseListeners.add(cb);
+      return () => overlayCloseListeners.delete(cb);
+    },
+    requestClose() {
+      return ipcRenderer.invoke("karate:overlay-close-request");
+    },
+  },
+
+  // Network / multiplayer surface.
+  network: {
+    getStatus() { return ipcRenderer.invoke("karate:network-get-status"); },
+    setMode(mode) { return ipcRenderer.invoke("karate:network-set-mode", mode); },
+    importLocalState(state) { return ipcRenderer.invoke("karate:network-import-local-state", state); },
+    sendAction(action) { return ipcRenderer.invoke("karate:network-send-action", action); },
+    listDiscoveredServers() { return ipcRenderer.invoke("karate:network-list-discovered-servers"); },
+    connectTo(serverId) { return ipcRenderer.invoke("karate:network-connect-to", serverId); },
+    disconnectAllClients() { return ipcRenderer.invoke("karate:network-disconnect-all-clients"); },
+    onState(cb) {
+      netStateListeners.add(cb);
+      return () => netStateListeners.delete(cb);
+    },
+    onStatus(cb) {
+      netStatusListeners.add(cb);
+      return () => netStatusListeners.delete(cb);
+    },
+    onAck(cb) {
+      netAckListeners.add(cb);
+      return () => netAckListeners.delete(cb);
+    },
+    onRejected(cb) {
+      netRejectedListeners.add(cb);
+      return () => netRejectedListeners.delete(cb);
+    },
+    onRivalServer(cb) {
+      netRivalListeners.add(cb);
+      return () => netRivalListeners.delete(cb);
+    },
   },
 });

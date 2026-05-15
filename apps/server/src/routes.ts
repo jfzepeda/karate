@@ -11,11 +11,11 @@ import type { KeyPair } from "./keys";
 import {
   signLicenseToken,
   requireAuth,
-  requireRole,
   type AuthedRequest,
   type AuthDeps,
   JWT_TTL_SECONDS,
 } from "./auth";
+import { requireLocalAdmin } from "./local-admin-auth";
 import type { LicenseStore } from "./licenses";
 import type { KioskSession, Role, Feature } from "@karate/core";
 import {
@@ -38,11 +38,12 @@ export function buildRoutes(
   keys: KeyPair,
   licenses: LicenseStore,
   kioskSession?: KioskSession | null,
+  getLocalAdminToken: () => string | null = () => null,
 ): Router {
   const deps: AuthDeps = { config, keys, licenses };
   const router = Router();
   const auth = requireAuth(deps);
-  const superOnly = requireRole("superadmin");
+  const localAdmin = requireLocalAdmin(getLocalAdminToken);
 
   // ---------------------------------------------------------------
   // Rate limiters
@@ -335,7 +336,7 @@ export function buildRoutes(
     }
   );
 
-  router.put("/api/data", auth, superOnly, (req: AuthedRequest, res: Response) => {
+  router.put("/api/data", localAdmin, (req: Request, res: Response) => {
     const incoming = req.body && typeof req.body === "object" ? req.body : null;
     if (!incoming) {
       res.status(400).json({ error: "invalid_payload" });
@@ -343,8 +344,8 @@ export function buildRoutes(
     }
     const file = saveData(config.dataDir, incoming as Record<string, unknown>);
     logActivity(config.dataDir, {
-      ts: Date.now(), event: "data_update", userId: req.auth!.sub,
-      ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      ts: Date.now(), event: "data_update", userId: "local-admin",
+      ip: clientIp(req), jti: null, result: "success",
     });
     res.set("ETag", file.etag);
     res.json(file);
@@ -371,8 +372,7 @@ export function buildRoutes(
 
   router.post(
     "/api/upload-logo",
-    auth,
-    superOnly,
+    localAdmin,
     (req, res, next) => {
       upload.single("logo")(req, res, (err: unknown) => {
         if (err) {
@@ -382,7 +382,7 @@ export function buildRoutes(
         next();
       });
     },
-    (req: AuthedRequest, res: Response) => {
+    (req: Request, res: Response) => {
       const dir = logoDir(config.dataDir);
       const keep = (req as Request & { file?: Express.Multer.File }).file?.filename;
       for (const f of fs.readdirSync(dir)) {
@@ -390,18 +390,18 @@ export function buildRoutes(
       }
       const info = readLogoInfo(config.dataDir);
       logActivity(config.dataDir, {
-        ts: Date.now(), event: "logo_upload", userId: req.auth!.sub,
-        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        ts: Date.now(), event: "logo_upload", userId: "local-admin",
+        ip: clientIp(req), jti: null, result: "success",
       });
       res.json({ logo: info });
     }
   );
 
-  router.delete("/api/upload-logo", auth, superOnly, (req: AuthedRequest, res: Response) => {
+  router.delete("/api/upload-logo", localAdmin, (req: Request, res: Response) => {
     clearLogo(config.dataDir);
     logActivity(config.dataDir, {
-      ts: Date.now(), event: "logo_remove", userId: req.auth!.sub,
-      ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      ts: Date.now(), event: "logo_remove", userId: "local-admin",
+      ip: clientIp(req), jti: null, result: "success",
     });
     res.json({ ok: true });
   });
@@ -434,19 +434,19 @@ export function buildRoutes(
   // ---------------------------------------------------------------
   // Activity log (superadmin)
   // ---------------------------------------------------------------
-  router.get("/api/activity", auth, superOnly, (req: AuthedRequest, res: Response) => {
+  router.get("/api/activity", localAdmin, (req: Request, res: Response) => {
     const max = Math.min(Number(req.query.max ?? 200), 2000);
     res.json({ entries: readActivity(config.dataDir, max) });
   });
 
   // ---------------------------------------------------------------
-  // App config (superadmin)
+  // App config (local admin)
   // ---------------------------------------------------------------
-  router.get("/api/app-config", auth, superOnly, (_req: AuthedRequest, res: Response) => {
+  router.get("/api/app-config", localAdmin, (_req: Request, res: Response) => {
     res.json(loadAppConfig(config.dataDir));
   });
 
-  router.put("/api/app-config", auth, superOnly, (req: AuthedRequest, res: Response) => {
+  router.put("/api/app-config", localAdmin, (req: Request, res: Response) => {
     const { sessionTtlMinutes } = req.body ?? {};
     if (typeof sessionTtlMinutes !== "number" || sessionTtlMinutes < 1) {
       res.status(400).json({ error: "invalid_value" });
@@ -455,30 +455,31 @@ export function buildRoutes(
     const cfg = { sessionTtlMinutes: Math.floor(sessionTtlMinutes) };
     saveAppConfig(config.dataDir, cfg);
     logActivity(config.dataDir, {
-      ts: Date.now(), event: "access_extend", userId: req.auth!.sub,
-      ip: clientIp(req), jti: req.auth!.jti, result: "success",
+      ts: Date.now(), event: "access_extend", userId: "local-admin",
+      ip: clientIp(req), jti: null, result: "success",
       message: `set sessionTtlMinutes=${cfg.sessionTtlMinutes}`,
     });
     res.json(cfg);
   });
 
   // ---------------------------------------------------------------
-  // Admin license management (superadmin)
+  // Admin license management (local admin)
+  // Claim codes are referee-only; superadmin access is granted by the
+  // local stealth chord (no role-bearing JWT involved).
   // ---------------------------------------------------------------
-  router.get("/api/admin/licenses", auth, superOnly, (_req: AuthedRequest, res: Response) => {
+  router.get("/api/admin/licenses", localAdmin, (_req: Request, res: Response) => {
     res.json({ licenses: licenses.list() });
   });
 
   router.post(
     "/api/admin/licenses",
-    auth,
-    superOnly,
-    (req: AuthedRequest, res: Response) => {
+    localAdmin,
+    (req: Request, res: Response) => {
       const body = (req.body ?? {}) as {
-        role?: Role; features?: Feature[]; label?: string;
+        features?: Feature[]; label?: string;
         ttlDays?: number; plan?: string;
       };
-      const role: Role = body.role === "superadmin" ? "superadmin" : "referee";
+      const role: Role = "referee";
       const features = Array.isArray(body.features) && body.features.length
         ? body.features
         : FEATURE_PRESETS[role];
@@ -490,7 +491,7 @@ export function buildRoutes(
       });
       logActivity(config.dataDir, {
         ts: Date.now(), event: "LICENSE_CODE_CREATED", userId: record.userId,
-        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        ip: clientIp(req), jti: null, result: "success",
         message: `role=${role} label=${label}`,
       });
       res.json({ code, userId: record.userId, label, role, features, expiresAt: record.expiresAt });
@@ -499,15 +500,14 @@ export function buildRoutes(
 
   router.post(
     "/api/admin/licenses/:userId/revoke",
-    auth,
-    superOnly,
-    (req: AuthedRequest, res: Response) => {
+    localAdmin,
+    (req: Request, res: Response) => {
       const codeId = licenses.findCodeIdByUserId(req.params.userId);
       if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
       licenses.revokeLineage(codeId);
       logActivity(config.dataDir, {
         ts: Date.now(), event: "LICENSE_REVOKE", userId: req.params.userId,
-        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        ip: clientIp(req), jti: null, result: "success",
       });
       res.json({ ok: true });
     }
@@ -515,15 +515,14 @@ export function buildRoutes(
 
   router.post(
     "/api/admin/licenses/:userId/transfer",
-    auth,
-    superOnly,
-    (req: AuthedRequest, res: Response) => {
+    localAdmin,
+    (req: Request, res: Response) => {
       const codeId = licenses.findCodeIdByUserId(req.params.userId);
       if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
       licenses.transfer(codeId);
       logActivity(config.dataDir, {
         ts: Date.now(), event: "LICENSE_TRANSFER", userId: req.params.userId,
-        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        ip: clientIp(req), jti: null, result: "success",
       });
       res.json({ ok: true });
     }
@@ -531,9 +530,8 @@ export function buildRoutes(
 
   router.post(
     "/api/admin/licenses/:userId/extend",
-    auth,
-    superOnly,
-    (req: AuthedRequest, res: Response) => {
+    localAdmin,
+    (req: Request, res: Response) => {
       const days = Math.max(1, Number((req.body ?? {}).days ?? 30));
       const codeId = licenses.findCodeIdByUserId(req.params.userId);
       if (!codeId) { res.status(404).json({ error: "not_found" }); return; }
@@ -542,7 +540,7 @@ export function buildRoutes(
       if (!ok) { res.status(409).json({ error: "already_redeemed" }); return; }
       logActivity(config.dataDir, {
         ts: Date.now(), event: "LICENSE_EXTEND", userId: req.params.userId,
-        ip: clientIp(req), jti: req.auth!.jti, result: "success",
+        ip: clientIp(req), jti: null, result: "success",
         message: `+${days}d`,
       });
       res.json({ ok: true, expiresAt: newExpiry });

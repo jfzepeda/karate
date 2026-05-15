@@ -1,23 +1,22 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import type { LicenseCodeRecord, Role } from "@karate/core";
-import { useAuth } from "@/lib/auth-context";
+import type { LicenseCodeRecord } from "@karate/core";
+import { useOverlay } from "@/lib/overlay-context";
 import {
-  apiAdminGetLicenses,
-  apiAdminCreateLicense,
-  apiAdminRevokeLicense,
-  apiAdminTransferLicense,
-  apiAdminExtendLicense,
-  apiGetAppConfig,
-  apiUpdateAppConfig,
-} from "@/lib/api-client";
+  adminGetLicenses,
+  adminCreateLicense,
+  adminRevokeLicense,
+  adminTransferLicense,
+  adminExtendLicense,
+  adminGetAppConfig,
+  adminUpdateAppConfig,
+} from "@/lib/admin-api-client";
 
 export function UsersSection() {
-  const { token } = useAuth();
+  const { getLocalAdminToken } = useOverlay();
   const [licenses, setLicenses] = useState<LicenseCodeRecord[]>([]);
   const [newLabel, setNewLabel] = useState("");
-  const [newRole, setNewRole] = useState<Role>("referee");
   const [newTtl, setNewTtl] = useState("30");
   const [lastCode, setLastCode] = useState<string | null>(null);
   const [ttlMinutes, setTtlMinutes] = useState("480");
@@ -27,30 +26,31 @@ export function UsersSection() {
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    const token = getLocalAdminToken();
     if (!token) return;
     setLoading(true);
     try {
       const [list, cfg] = await Promise.all([
-        apiAdminGetLicenses(token),
-        apiGetAppConfig(token),
+        adminGetLicenses(token),
+        adminGetAppConfig(token),
       ]);
       setLicenses(list.licenses);
       setTtlMinutes(String(cfg.sessionTtlMinutes));
     } catch (e) {
       setError(e instanceof Error ? e.message : "fetch_failed");
     } finally { setLoading(false); }
-  }, [token]);
+  }, [getLocalAdminToken]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
   async function handleCreate() {
+    const token = getLocalAdminToken();
     if (!token) return;
     if (!newLabel.trim()) { setError("Label is required."); return; }
     setError(null);
     setGenerating(true);
     try {
-      const r = await apiAdminCreateLicense(token, {
-        role: newRole,
+      const r = await adminCreateLicense(token, {
         label: newLabel.trim(),
         ttlDays: parseInt(newTtl, 10) || 30,
       });
@@ -63,33 +63,37 @@ export function UsersSection() {
   }
 
   async function handleRevoke(userId: string) {
+    const token = getLocalAdminToken();
     if (!token) return;
     if (!confirm("Revoke this license? The registered device will lose access on next renewal.")) return;
-    try { await apiAdminRevokeLicense(token, userId); refresh(); }
+    try { await adminRevokeLicense(token, userId); refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : "revoke_failed"); }
   }
 
   async function handleTransfer(userId: string) {
+    const token = getLocalAdminToken();
     if (!token) return;
     if (!confirm("Reset the machine fingerprint? The original code becomes reclaimable on a new device.")) return;
-    try { await apiAdminTransferLicense(token, userId); refresh(); }
+    try { await adminTransferLicense(token, userId); refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : "transfer_failed"); }
   }
 
   async function handleExtend(userId: string) {
+    const token = getLocalAdminToken();
     if (!token) return;
     const days = parseInt(prompt("Extend by how many days?", "30") || "0", 10);
     if (!days || days < 1) return;
-    try { await apiAdminExtendLicense(token, userId, days); refresh(); }
+    try { await adminExtendLicense(token, userId, days); refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : "extend_failed"); }
   }
 
   async function handleSaveTtl() {
+    const token = getLocalAdminToken();
     if (!token) return;
     const v = parseInt(ttlMinutes, 10);
     if (!v || v < 1) return;
     setSavingTtl(true);
-    try { await apiUpdateAppConfig(token, v); } finally { setSavingTtl(false); }
+    try { await adminUpdateAppConfig(token, v); } finally { setSavingTtl(false); }
   }
 
   return (
@@ -119,10 +123,6 @@ export function UsersSection() {
             onChange={(e) => setNewLabel(e.target.value)}
             style={{ flex: 1, minWidth: 200 }}
           />
-          <select value={newRole} onChange={(e) => setNewRole(e.target.value as Role)}>
-            <option value="referee">Referee</option>
-            <option value="superadmin">Superadmin</option>
-          </select>
           <input
             type="number"
             min={1}

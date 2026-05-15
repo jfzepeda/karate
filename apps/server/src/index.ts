@@ -9,7 +9,7 @@ import { buildRoutes } from "./routes";
 import { LicenseStore } from "./licenses";
 import { signLicenseToken } from "./auth";
 import { saveData } from "./data-store";
-import type { KioskSession, Role } from "@karate/core";
+import type { KioskSession } from "@karate/core";
 
 export interface KarateServer {
   app: Express;
@@ -22,8 +22,18 @@ export interface KarateServer {
   stop(): Promise<void>;
 }
 
+export interface CreateServerOverrides extends Partial<ServerConfig> {
+  /**
+   * Getter for the per-launch local admin token. When provided, the server
+   * gates tournament-config / license-admin endpoints behind a loopback +
+   * token check instead of a superadmin JWT role. The token never leaves
+   * the main process / loopback boundary.
+   */
+  localAdminToken?: () => string | null;
+}
+
 export async function createServer(
-  overrides: Partial<ServerConfig> = {}
+  overrides: CreateServerOverrides = {}
 ): Promise<KarateServer> {
   const config = defaultConfig(overrides);
   ensureDir(config.dataDir);
@@ -47,19 +57,18 @@ export async function createServer(
     const lc = config.launchConfig;
     if (lc.expiresAt > Date.now()) {
       saveData(config.dataDir, lc.data);
-      const role = lc.role as Role;
-      const features = role === "superadmin"
-        ? ["scoring", "public_display", "bracket_view", "tournament_config",
-            "logo_upload", "user_management", "activity_log"] as const
-        : ["scoring", "public_display", "bracket_view"] as const;
+      // All kiosk sessions are referee-only. Superadmin access is granted
+      // exclusively via the local stealth chord, which delivers a separate
+      // local-admin token (see local-admin-auth.ts).
+      const features = ["scoring", "public_display", "bracket_view"] as const;
       const userId = "kiosk_" + Math.random().toString(36).slice(2, 10);
       const { token, payload } = await signLicenseToken(
         { config, keys, licenses },
         {
           userId,
-          role,
+          role: "referee",
           features: [...features],
-          plan: role,
+          plan: "referee",
           machineFingerprint: "kiosk-no-fp",
           activatedAt: Math.floor(Date.now() / 1000),
           ttlSeconds: lc.sessionTtlSeconds ?? Math.floor((lc.expiresAt - Date.now()) / 1000),
@@ -69,16 +78,18 @@ export async function createServer(
         token,
         issuedAt: payload.iat * 1000,
         expiresAt: payload.exp * 1000,
-        user: { role, features: [...features] },
+        user: { role: "referee", features: [...features] },
       };
     }
   }
+
+  const getLocalAdminToken = overrides.localAdminToken ?? (() => null);
 
   const app = express();
   app.disable("x-powered-by");
   app.use(cors());
   app.use(express.json({ limit: "5mb" }));
-  app.use(buildRoutes(config, keys, licenses, kioskSession));
+  app.use(buildRoutes(config, keys, licenses, kioskSession, getLocalAdminToken));
 
   if (config.staticDir && fs.existsSync(config.staticDir)) {
     const staticDir = config.staticDir;

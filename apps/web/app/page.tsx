@@ -11,8 +11,7 @@ export default function Home() {
 
   useEffect(() => {
     if (status.kind !== "authed" || !user) return;
-    if (user.role === "superadmin") router.replace("/superadmin");
-    else router.replace("/area-select");
+    router.replace("/area-select");
   }, [router, status, user]);
 
   return (

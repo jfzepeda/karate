@@ -46,6 +46,18 @@ import {
   updateCategoryDef as updateCategoryDefImpl,
 } from "@karate/core";
 import type { Participant } from "@karate/core";
+import { isActionable, useNetwork } from "./network-context";
+import * as Actions from "./store-actions";
+import {
+  OPTIMISTIC_TIMEOUT_MS,
+  addEntry,
+  applyAck,
+  applyReject,
+  applyTimeout,
+  deltaForSide,
+  reconcileWithState,
+  type OptimisticMap,
+} from "./optimistic";
 
 type Updater = (s: AppState) => void;
 
@@ -91,6 +103,8 @@ interface StoreApi {
     duration: number,
     keys: AppState["settings"]["keys"]
   ) => void;
+  /** True when the store is willing to dispatch actions right now. */
+  actionable: boolean;
 }
 
 const StoreContext = createContext<StoreApi | null>(null);
@@ -103,21 +117,57 @@ function deepClone<T>(x: T): T {
     : JSON.parse(JSON.stringify(x));
 }
 
-export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<AppState>(() => buildInitialState());
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  const channelRef = useRef<BroadcastChannel | null>(null);
-  const prevRemainingRef = useRef<number>(state.timer.remaining);
+function mergeOptimistic(state: AppState, optimistic: OptimisticMap): AppState {
+  if (optimistic.size === 0) return state;
+  const blueDelta = deltaForSide(optimistic, "blue");
+  const redDelta = deltaForSide(optimistic, "red");
+  if (blueDelta === 0 && redDelta === 0) return state;
+  return {
+    ...state,
+    match: {
+      ...state.match,
+      bluePoints: state.match.bluePoints + blueDelta,
+      redPoints: state.match.redPoints + redDelta,
+    },
+  };
+}
 
-  // Hydrate from localStorage on mount
+function sendAction(env: ReturnType<typeof Actions.scorePoint>): Promise<{ ok: boolean; error?: string }> {
+  if (typeof window === "undefined") return Promise.resolve({ ok: false, error: "no_window" });
+  const net = window.__KARATE__?.network;
+  if (!net) return Promise.resolve({ ok: false, error: "no_network" });
+  return net.sendAction(env);
+}
+
+export function StoreProvider({ children }: { children: React.ReactNode }) {
+  const { status, networkState, networkStateVersion } = useNetwork();
+  const mode = status.mode;
+  const actionable = isActionable(status);
+
+  const [localState, setLocalState] = useState<AppState>(() => buildInitialState());
+  const [optimistic, setOptimistic] = useState<OptimisticMap>(new Map());
+  const localStateRef = useRef(localState);
+  localStateRef.current = localState;
+  const channelRef = useRef<BroadcastChannel | null>(null);
+  const prevRemainingRef = useRef<number>(localState.timer.remaining);
+  const prevWarnedAtRef = useRef<number | undefined>(undefined);
+  const prevExpiredAtRef = useRef<number | undefined>(undefined);
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+
+  // Hydrate local-state from localStorage on mount (used only in STANDALONE,
+  // but we keep it warm so a STANDALONE → SERVER first-time enable can hand
+  // its current snapshot off via importLocalState).
   useEffect(() => {
-    const loaded = loadState(typeof window !== "undefined" ? window.localStorage : null);
-    setState(loaded);
-    stateRef.current = loaded;
+    if (typeof window === "undefined") return;
+    const loaded = loadState(window.localStorage);
+    setLocalState(loaded);
+    localStateRef.current = loaded;
   }, []);
 
-  // BroadcastChannel + storage sync
+  // BroadcastChannel: same-machine multi-window sync. In CLIENT/SERVER modes
+  // we still publish so a secondary BrowserWindow (public scoreboard) picks
+  // up state without its own IPC subscription.
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!("BroadcastChannel" in window)) return;
@@ -125,13 +175,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     channelRef.current = ch;
     ch.onmessage = (ev) => {
       if (!ev.data || ev.data.from === TAB_ID) return;
-      setState(ev.data.state as AppState);
+      if (modeRef.current !== "standalone") return; // network state wins
+      setLocalState(ev.data.state as AppState);
     };
     const onStorage = (ev: StorageEvent) => {
+      if (modeRef.current !== "standalone") return;
       if (ev.key !== STORAGE_KEY || !ev.newValue) return;
-      try {
-        setState(JSON.parse(ev.newValue) as AppState);
-      } catch {}
+      try { setLocalState(JSON.parse(ev.newValue) as AppState); } catch {}
     };
     window.addEventListener("storage", onStorage);
     return () => {
@@ -141,28 +191,71 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const publish = useCallback((next: AppState) => {
+  // Rebroadcast networked state to same-machine BC consumers (public window).
+  useEffect(() => {
+    if (mode === "standalone") return;
+    if (!networkState) return;
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(networkState));
     } catch {}
+    channelRef.current?.postMessage({ from: TAB_ID, state: networkState });
+    setOptimistic((prev) => reconcileWithState(prev, networkStateVersion));
+  }, [mode, networkState, networkStateVersion]);
+
+  // Listen for action acks/rejects from main process to update optimistic map.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const net = window.__KARATE__?.network;
+    if (!net) return;
+    const offAck = net.onAck(({ actionId, newVersion }) => {
+      setOptimistic((prev) => applyAck(prev, actionId, newVersion));
+    });
+    const offRej = net.onRejected(({ actionId }) => {
+      setOptimistic((prev) => applyReject(prev, actionId));
+    });
+    return () => { offAck(); offRej(); };
+  }, []);
+
+  const publishLocal = useCallback((next: AppState) => {
+    if (modeRef.current !== "standalone") return;
+    try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
     channelRef.current?.postMessage({ from: TAB_ID, state: next });
   }, []);
 
-  const update = useCallback(
-    (fn: Updater) => {
-      setState((prev) => {
-        const next = deepClone(prev);
-        fn(next);
-        publish(next);
-        stateRef.current = next;
-        return next;
-      });
+  // Update path used by STANDALONE actions and by networked complex actions
+  // (which fork-then-send REPLACE_STATE).
+  const updateLocal = useCallback(
+    (fn: Updater): AppState => {
+      const next = deepClone(localStateRef.current);
+      fn(next);
+      setLocalState(next);
+      localStateRef.current = next;
+      publishLocal(next);
+      return next;
     },
-    [publish]
+    [publishLocal]
   );
 
-  // --- Timer loop (only the tab that has claimed ownership ticks) ---
+  // Public `update`. In STANDALONE, mutate local state directly. In networked
+  // modes, fork the current networked state, apply the mutation, and ask the
+  // server to adopt the result.
+  const update = useCallback(
+    (fn: Updater) => {
+      if (modeRef.current === "standalone") {
+        updateLocal(fn);
+        return;
+      }
+      const base = networkState ?? buildInitialState();
+      const candidate = deepClone(base);
+      fn(candidate);
+      void sendAction(Actions.replaceState(candidate));
+    },
+    [networkState, updateLocal]
+  );
+
+  // ---- STANDALONE-only timer tick (mirrors the legacy owner-elected loop) ----
   useEffect(() => {
+    if (mode !== "standalone") return;
     const onPathChange = () => {
       if (typeof window === "undefined") return;
       if (window.location.pathname.startsWith("/private")) {
@@ -172,24 +265,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     onPathChange();
     window.addEventListener("popstate", onPathChange);
     return () => window.removeEventListener("popstate", onPathChange);
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
+    if (mode !== "standalone") return;
     const id = setInterval(() => {
       if (typeof window === "undefined") return;
       if (!window.location.pathname.startsWith("/private")) return;
-      // Claim ownership if unclaimed — handles Next.js pushState navigation which
-      // never fires popstate, so the separate ownership effect may not have run.
       const owner = window.localStorage.getItem(TIMER_OWNER_KEY);
       if (owner !== TAB_ID) {
-        if (owner !== null) return; // Another tab already owns it
+        if (owner !== null) return;
         window.localStorage.setItem(TIMER_OWNER_KEY, TAB_ID);
       }
-      const cur = stateRef.current;
+      const cur = localStateRef.current;
       const t = cur.timer;
       if (!t.running || t.remaining <= 0) return;
       if (cur.match.discipline === "kata") return;
-      update((s) => {
+      updateLocal((s) => {
         const tt = s.timer;
         if (!tt.running || tt.remaining <= 0) return;
         tt.remaining = Math.max(0, tt.remaining - 1);
@@ -205,111 +297,195 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       });
     }, 1000);
     return () => clearInterval(id);
-  }, [update]);
+  }, [mode, updateLocal]);
 
-  // --- Action implementations ---
+  // ---- Server-driven timer transition beeps (CLIENT / SERVER modes) ----
+  useEffect(() => {
+    if (mode === "standalone") return;
+    if (!networkState) return;
+    const t = networkState.timer;
+    if (t.warnedAt && t.warnedAt !== prevWarnedAtRef.current) {
+      prevWarnedAtRef.current = t.warnedAt;
+      beep(900, 0.22);
+    }
+    if (t.expiredAt && t.expiredAt !== prevExpiredAtRef.current) {
+      prevExpiredAtRef.current = t.expiredAt;
+      tripleBeep();
+    }
+  }, [mode, networkState]);
+
+  // ---- Effective state used by all consumers ----
+  const baseState = mode === "standalone" ? localState : (networkState ?? buildInitialState());
+  const state = mergeOptimistic(baseState, optimistic);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // ---- Helpers used by action methods ----
+  function sendNamed(env: ReturnType<typeof Actions.scorePoint>) {
+    void sendAction(env);
+  }
+
+  function dispatchScore(side: "blue" | "red", n: number) {
+    if (!actionable) return;
+    if (mode === "standalone") {
+      updateLocal((s) => {
+        if (side === "blue") s.match.bluePoints = Math.max(0, s.match.bluePoints + n);
+        else s.match.redPoints = Math.max(0, s.match.redPoints + n);
+        const ref = s.match.activeMatchRef;
+        const threshold = s.tournament.settings.pointDifference ?? 0;
+        if (ref && s.match.discipline === "combat" && threshold > 0) {
+          const winnerSide = computeCombatWinner(s.match, threshold);
+          if (winnerSide) {
+            s.timer.running = false;
+            const winnerName = winnerSide === "blue" ? s.match.blueName : s.match.redName;
+            const loserName = winnerSide === "blue" ? s.match.redName : s.match.blueName;
+            finalizeMatchByRef(s, ref, winnerName, loserName, false);
+            const next = findNextMatch(s, ref);
+            if (next) loadMatchToScoreboardImpl(s, next);
+          }
+        }
+      });
+      return;
+    }
+    const env = Actions.scorePoint(side, n);
+    // Optimistic overlay only on CLIENT; SERVER mode's IPC roundtrip is fast
+    // enough that the overlay isn't needed (and would clutter the canonical
+    // state shown to other clients via BC).
+    if (mode === "client") {
+      setOptimistic((prev) =>
+        addEntry(prev, env.actionId, {
+          side, n,
+          newVersionExpected: null,
+          queuedAt: Date.now(),
+        })
+      );
+      setTimeout(() => {
+        setOptimistic((prev) => applyTimeout(prev, env.actionId));
+      }, OPTIMISTIC_TIMEOUT_MS);
+    }
+    sendNamed(env);
+  }
+
+  // ---- Action implementations ----
   const api: StoreApi = useMemo(
     () => ({
       state,
       update,
-      setActiveCategory: (catId) =>
-        update((s) => {
-          s.tournament.activeCategoryId = catId;
-        }),
-      setActiveSubcategory: (catId, subId) =>
-        update((s) => {
-          const cat = s.tournament.categories[catId];
-          if (cat) cat.activeSubcategoryId = subId;
-        }),
-      setActiveDiscipline: (catId, subId, discipline) =>
-        update((s) => {
-          const sub = getSubcategory(s, catId, subId);
-          if (sub) sub.activeDiscipline = discipline;
-        }),
-      loadMatch: (ref) =>
-        update((s) => {
-          loadMatchToScoreboardImpl(s, ref);
-        }),
-      advanceActiveMatch: () =>
-        update((s) => {
-          const ref = s.match.activeMatchRef;
-          if (!ref) return;
-          const m = getMatchByRef(s, ref);
-          if (!m || m.winner) return;
-          s.match.discipline = ref.discipline;
-          const threshold = s.tournament.settings.pointDifference ?? 0;
-          const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
-          if (!winnerSide) {
-            s.jury = {
-              competitors: [s.match.blueName, s.match.redName],
-              context: { kind: "match", ref },
-            };
-            return;
-          }
-          const winnerName =
-            winnerSide === "blue" ? s.match.blueName : s.match.redName;
-          const loserName =
-            winnerSide === "blue" ? s.match.redName : s.match.blueName;
-          finalizeMatchByRef(s, ref, winnerName, loserName, false);
-          const next = findNextMatch(s, ref);
-          if (next) loadMatchToScoreboardImpl(s, next);
-        }),
-      resolveJury: (chosenName) =>
-        update((s) => {
-          if (!s.jury) return;
-          const j = s.jury;
-          const other =
-            j.competitors[0] === chosenName ? j.competitors[1] : j.competitors[0];
-          const ctx = j.context;
-          let searchFromRef: import("@karate/core").ActiveMatchRef | null = null;
-          if (ctx.kind === "match") {
-            searchFromRef = ctx.ref;
-            finalizeMatchByRef(s, ctx.ref, chosenName, other, true);
-          } else if (ctx.kind === "series-final") {
-            const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
-            if (sub) {
-              const tree = sub.trees[ctx.subRef.discipline] as {
-                winner: string | null;
-                juryDecided: boolean;
-              };
-              tree.winner = chosenName;
-              tree.juryDecided = true;
+      actionable,
+      setActiveCategory: (catId) => {
+        if (mode === "standalone") {
+          updateLocal((s) => { s.tournament.activeCategoryId = catId; });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.setActiveCategory(catId));
+        }
+      },
+      setActiveSubcategory: (catId, subId) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            const cat = s.tournament.categories[catId];
+            if (cat) cat.activeSubcategoryId = subId;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.setActiveSubcategory(catId, subId));
+        }
+      },
+      setActiveDiscipline: (catId, subId, discipline) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            const sub = getSubcategory(s, catId, subId);
+            if (sub) sub.activeDiscipline = discipline;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.setActiveDiscipline(catId, subId, discipline));
+        }
+      },
+      loadMatch: (ref) => {
+        if (mode === "standalone") {
+          updateLocal((s) => { loadMatchToScoreboardImpl(s, ref); });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.selectMatch(ref));
+        }
+      },
+      advanceActiveMatch: () => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            const ref = s.match.activeMatchRef;
+            if (!ref) return;
+            const m = getMatchByRef(s, ref);
+            if (!m || m.winner) return;
+            s.match.discipline = ref.discipline;
+            const threshold = s.tournament.settings.pointDifference ?? 0;
+            const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
+            if (!winnerSide) {
+              s.jury = { competitors: [s.match.blueName, s.match.redName], context: { kind: "match", ref } };
+              return;
             }
-            searchFromRef = { ...ctx.subRef, path: { kind: "series", idx: 1 } };
-          } else if (ctx.kind === "rr-final") {
-            const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
-            if (sub) {
-              const tree = sub.trees[ctx.subRef.discipline] as {
-                winner: string | null;
-                juryDecided: boolean;
-              };
-              tree.winner = chosenName;
-              tree.juryDecided = true;
-            }
-            searchFromRef = { ...ctx.subRef, path: { kind: "rr", pair: "bc" } };
-          }
-          s.jury = null;
-          if (searchFromRef) {
-            const next = findNextMatch(s, searchFromRef);
+            const winnerName = winnerSide === "blue" ? s.match.blueName : s.match.redName;
+            const loserName = winnerSide === "blue" ? s.match.redName : s.match.blueName;
+            finalizeMatchByRef(s, ref, winnerName, loserName, false);
+            const next = findNextMatch(s, ref);
             if (next) loadMatchToScoreboardImpl(s, next);
-          }
-        }),
-      applyTournamentSettings: (size, mode, pointDiff) => {
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.advanceWinner());
+        }
+      },
+      resolveJury: (chosenName) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            if (!s.jury) return;
+            const j = s.jury;
+            const other = j.competitors[0] === chosenName ? j.competitors[1] : j.competitors[0];
+            const ctx = j.context;
+            let searchFromRef: ActiveMatchRef | null = null;
+            if (ctx.kind === "match") {
+              searchFromRef = ctx.ref;
+              finalizeMatchByRef(s, ctx.ref, chosenName, other, true);
+            } else if (ctx.kind === "series-final") {
+              const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
+              if (sub) {
+                const tree = sub.trees[ctx.subRef.discipline] as { winner: string | null; juryDecided: boolean };
+                tree.winner = chosenName;
+                tree.juryDecided = true;
+              }
+              searchFromRef = { ...ctx.subRef, path: { kind: "series", idx: 1 } };
+            } else if (ctx.kind === "rr-final") {
+              const sub = getSubcategory(s, ctx.subRef.categoryId, ctx.subRef.subcategoryId);
+              if (sub) {
+                const tree = sub.trees[ctx.subRef.discipline] as { winner: string | null; juryDecided: boolean };
+                tree.winner = chosenName;
+                tree.juryDecided = true;
+              }
+              searchFromRef = { ...ctx.subRef, path: { kind: "rr", pair: "bc" } };
+            }
+            s.jury = null;
+            if (searchFromRef) {
+              const next = findNextMatch(s, searchFromRef);
+              if (next) loadMatchToScoreboardImpl(s, next);
+            }
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.resolveJury(chosenName));
+        }
+      },
+      applyTournamentSettings: (size, mode_, pointDiff) => {
         const cur = stateRef.current.tournament.settings;
-        const structureChanged =
-          cur.subcategorySize !== size || cur.disciplineMode !== mode;
+        const structureChanged = cur.subcategorySize !== size || cur.disciplineMode !== mode_;
         if (!structureChanged && cur.pointDifference === pointDiff) return false;
-        const ok =
-          !structureChanged ||
-          (typeof window !== "undefined"
-            ? window.confirm("This will reset all bracket progress. Continue?")
-            : true);
+        const ok = !structureChanged ||
+          (typeof window !== "undefined" ? window.confirm("This will reset all bracket progress. Continue?") : true);
         if (!ok) return false;
         update((s) => {
           s.tournament.settings.pointDifference = pointDiff;
           if (structureChanged) {
             s.tournament.settings.subcategorySize = size;
-            s.tournament.settings.disciplineMode = mode;
+            s.tournament.settings.disciplineMode = mode_;
             rebuildAllSubcategories(s);
             resetLiveScoreboard(s);
             s.jury = null;
@@ -317,171 +493,152 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
         return true;
       },
-      replaceParticipants: (list) =>
-        update((s) => replaceParticipantsImpl(s, list)),
-      addParticipant: (p) =>
-        update((s) => addParticipantImpl(s, p)),
-      removeParticipant: (id) =>
-        update((s) => removeParticipantImpl(s, id)),
-      setCategoryDefs: (defs) =>
-        update((s) => setCategoryDefsImpl(s, defs)),
-      addCategoryDef: (def) =>
-        update((s) => addCategoryDefImpl(s, def)),
-      updateCategoryDef: (def) =>
-        update((s) => updateCategoryDefImpl(s, def)),
+      replaceParticipants: (list) => update((s) => replaceParticipantsImpl(s, list)),
+      addParticipant: (p) => update((s) => addParticipantImpl(s, p)),
+      removeParticipant: (id) => update((s) => removeParticipantImpl(s, id)),
+      setCategoryDefs: (defs) => update((s) => setCategoryDefsImpl(s, defs)),
+      addCategoryDef: (def) => update((s) => addCategoryDefImpl(s, def)),
+      updateCategoryDef: (def) => update((s) => updateCategoryDefImpl(s, def)),
       removeCategoryDef: (id) => {
-        const ok =
-          typeof window !== "undefined"
-            ? window.confirm(
-                "Delete this category definition? Participants matching this definition will become unassigned until you create a new one."
-              )
-            : true;
+        const ok = typeof window !== "undefined"
+          ? window.confirm("Delete this category definition? Participants matching this definition will become unassigned until you create a new one.")
+          : true;
         if (!ok) return;
         update((s) => removeCategoryDefImpl(s, id));
       },
       reseed: (seed) => {
         if (typeof seed !== "number") {
-          const ok =
-            typeof window !== "undefined"
-              ? window.confirm(
-                  "This will reset all bracket progress and reassign all competitors randomly. Continue?"
-                )
-              : true;
+          const ok = typeof window !== "undefined"
+            ? window.confirm("This will reset all bracket progress and reassign all competitors randomly. Continue?")
+            : true;
           if (!ok) return;
         }
-        update((s) => {
-          reseedImpl(s, seed);
-        });
+        update((s) => { reseedImpl(s, seed); });
       },
-      setAreaCount: (n) =>
-        update((s) => setAreaCountImpl(s, n)),
-      assignSubcategoryToArea: (subId, areaIdx) =>
-        update((s) => assignSubcategoryToAreaImpl(s, subId, areaIdx)),
-      setLogoUrl: (url) =>
-        update((s) => setLogoUrlImpl(s, url)),
+      setAreaCount: (n) => update((s) => setAreaCountImpl(s, n)),
+      assignSubcategoryToArea: (subId, areaIdx) => update((s) => assignSubcategoryToAreaImpl(s, subId, areaIdx)),
+      setLogoUrl: (url) => update((s) => setLogoUrlImpl(s, url)),
       loadMockTournament: () => {
-        const ok =
-          typeof window !== "undefined"
-            ? window.confirm(
-                "Replace the current participants and category definitions with the demo tournament?"
-              )
-            : true;
+        const ok = typeof window !== "undefined"
+          ? window.confirm("Replace the current participants and category definitions with the demo tournament?")
+          : true;
         if (!ok) return;
         update((s) => {
           const mock = generateMockTournament();
           s.tournament.categoryDefs = mock.categoryDefs;
-          replaceParticipantsImpl(
-            s,
-            mock.participants.map(({ id: _id, ...rest }) => rest)
-          );
+          replaceParticipantsImpl(s, mock.participants.map(({ id: _id, ...rest }) => rest));
         });
       },
       resetScoreboard: () => {
-        const ok =
-          typeof window !== "undefined"
-            ? window.confirm("Reset the scoreboard? All current values will be cleared.")
-            : true;
+        const ok = typeof window !== "undefined"
+          ? window.confirm("Reset the scoreboard? All current values will be cleared.")
+          : true;
         if (!ok) return;
-        update((s) => resetLiveScoreboard(s));
+        if (mode === "standalone") {
+          updateLocal((s) => resetLiveScoreboard(s));
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.resetScoreboard());
+        }
       },
       eliminate: (side) => {
         const cur = stateRef.current;
-        const name =
-          side === "blue" ? cur.match.blueName : cur.match.redName;
+        const name = side === "blue" ? cur.match.blueName : cur.match.redName;
         if (!name) {
-          window.alert("No competitor loaded.");
+          if (typeof window !== "undefined") window.alert("No competitor loaded.");
           return;
         }
-        const ok = window.confirm(
-          `Eliminate ${name}? The opponent will advance.`
-        );
+        const ok = typeof window !== "undefined"
+          ? window.confirm(`Eliminate ${name}? The opponent will advance.`)
+          : true;
         if (!ok) return;
-        update((s) => {
-          if (side === "blue") s.match.blueEliminated = true;
-          else s.match.redEliminated = true;
-          s.timer.running = false;
-          const ref = s.match.activeMatchRef;
-          if (ref) {
-            s.match.discipline = ref.discipline;
-            const threshold = s.tournament.settings.pointDifference ?? 0;
-            const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
-            if (!winnerSide) {
-              s.jury = {
-                competitors: [s.match.blueName, s.match.redName],
-                context: { kind: "match", ref },
-              };
-              return;
-            }
-            const winnerName =
-              winnerSide === "blue" ? s.match.blueName : s.match.redName;
-            const loserName =
-              winnerSide === "blue" ? s.match.redName : s.match.blueName;
-            finalizeMatchByRef(s, ref, winnerName, loserName, false);
-            const next = findNextMatch(s, ref);
-            if (next) loadMatchToScoreboardImpl(s, next);
-          }
-        });
-      },
-      addPoints: (side, n) =>
-        update((s) => {
-          if (side === "blue")
-            s.match.bluePoints = Math.max(0, s.match.bluePoints + n);
-          else s.match.redPoints = Math.max(0, s.match.redPoints + n);
-          // Real-time point-difference win condition (combat only)
-          const ref = s.match.activeMatchRef;
-          const threshold = s.tournament.settings.pointDifference ?? 0;
-          if (ref && s.match.discipline === "combat" && threshold > 0) {
-            const winnerSide = computeCombatWinner(s.match, threshold);
-            if (winnerSide) {
-              s.timer.running = false;
-              const winnerName =
-                winnerSide === "blue" ? s.match.blueName : s.match.redName;
-              const loserName =
-                winnerSide === "blue" ? s.match.redName : s.match.blueName;
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            if (side === "blue") s.match.blueEliminated = true;
+            else s.match.redEliminated = true;
+            s.timer.running = false;
+            const ref = s.match.activeMatchRef;
+            if (ref) {
+              s.match.discipline = ref.discipline;
+              const threshold = s.tournament.settings.pointDifference ?? 0;
+              const winnerSide = computeWinner(s.match, threshold > 0 ? threshold : undefined);
+              if (!winnerSide) {
+                s.jury = { competitors: [s.match.blueName, s.match.redName], context: { kind: "match", ref } };
+                return;
+              }
+              const winnerName = winnerSide === "blue" ? s.match.blueName : s.match.redName;
+              const loserName = winnerSide === "blue" ? s.match.redName : s.match.blueName;
               finalizeMatchByRef(s, ref, winnerName, loserName, false);
               const next = findNextMatch(s, ref);
               if (next) loadMatchToScoreboardImpl(s, next);
             }
-          }
-        }),
-      setAdvantage: (side, value) =>
-        update((s) => {
-          if (side === "blue") s.match.blueAdvantage = value;
-          else s.match.redAdvantage = value;
-        }),
-      addPenalty: (side, delta) =>
-        update((s) => {
-          const key = side === "blue" ? "bluePenalties" : "redPenalties";
-          s.match[key] = Math.max(0, Math.min(5, s.match[key] + delta));
-          if (s.match[key] === 5 && delta > 0) s.timer.running = false;
-        }),
-      adjustTimer: (delta) =>
-        update((s) => {
-          s.timer.remaining = Math.max(0, s.timer.remaining + delta);
-          if (s.timer.remaining > 0) s.timer.finished = false;
-        }),
-      togglePause: () =>
-        update((s) => {
-          if (s.timer.remaining <= 0) return;
-          s.timer.running = !s.timer.running;
-          if (s.timer.running) s.timer.finished = false;
-        }),
-      saveAppSettings: (duration, keys) =>
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.eliminate(side));
+        }
+      },
+      addPoints: (side, n) => dispatchScore(side, n),
+      setAdvantage: (side, value) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            if (side === "blue") s.match.blueAdvantage = value;
+            else s.match.redAdvantage = value;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.setAdvantage(side, value));
+        }
+      },
+      addPenalty: (side, delta) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            const key = side === "blue" ? "bluePenalties" : "redPenalties";
+            s.match[key] = Math.max(0, Math.min(5, s.match[key] + delta));
+            if (s.match[key] === 5 && delta > 0) s.timer.running = false;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.addPenalty(side, delta));
+        }
+      },
+      adjustTimer: (delta) => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            s.timer.remaining = Math.max(0, s.timer.remaining + delta);
+            if (s.timer.remaining > 0) s.timer.finished = false;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.timerAdjust(delta));
+        }
+      },
+      togglePause: () => {
+        if (mode === "standalone") {
+          updateLocal((s) => {
+            if (s.timer.remaining <= 0) return;
+            s.timer.running = !s.timer.running;
+            if (s.timer.running) s.timer.finished = false;
+          });
+        } else {
+          if (!actionable) return;
+          sendNamed(Actions.timerToggle());
+        }
+      },
+      saveAppSettings: (duration, keys) => {
         update((s) => {
           if (Number.isFinite(duration) && duration > 0) {
             s.settings.defaultDuration = duration;
-            if (
-              !s.timer.running &&
-              s.timer.remaining === s.timer.duration
-            ) {
+            if (!s.timer.running && s.timer.remaining === s.timer.duration) {
               s.timer.remaining = duration;
             }
             s.timer.duration = duration;
           }
           s.settings.keys = keys;
-        }),
+        });
+      },
     }),
-    [state, update]
+    [state, update, updateLocal, mode, actionable, networkState]
   );
 
   return (
@@ -503,8 +660,9 @@ function ensureAudio(): AudioContext | null {
   if (audioCtx) return audioCtx;
   try {
     const Ctor =
-      (window as any).AudioContext || (window as any).webkitAudioContext;
-    audioCtx = new Ctor();
+      (window as unknown as { AudioContext?: typeof AudioContext; webkitAudioContext?: typeof AudioContext }).AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (Ctor) audioCtx = new Ctor();
   } catch {
     audioCtx = null;
   }

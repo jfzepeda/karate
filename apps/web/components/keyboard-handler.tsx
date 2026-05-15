@@ -24,6 +24,7 @@ export function KeyboardHandler({ suppress }: Props) {
     adjustTimer,
     togglePause,
     advanceActiveMatch,
+    actionable,
   } = useStore();
   const [tick, setTick] = useState(0);
   const inputRef = useRef<InputState>({
@@ -62,6 +63,7 @@ export function KeyboardHandler({ suppress }: Props) {
       const tag = (e.target as HTMLElement | null)?.tagName || "";
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (state.jury) return;
+      if (!actionable) return;
 
       const k = state.settings.keys;
       const key = e.key;
@@ -148,7 +150,7 @@ export function KeyboardHandler({ suppress }: Props) {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [state, addPoints, setAdvantage, addPenalty, adjustTimer, togglePause, advanceActiveMatch, suppress]);
+  }, [state, addPoints, setAdvantage, addPenalty, adjustTimer, togglePause, advanceActiveMatch, suppress, actionable]);
 
   // input-state hint banner
   const cur = inputRef.current;

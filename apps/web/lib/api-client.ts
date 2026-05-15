@@ -4,6 +4,56 @@ import type {
   AuthUser, Role, Feature, KioskSession, LicenseCodeRecord,
 } from "@karate/core";
 
+export interface NetworkStatusSnapshot {
+  mode: "standalone" | "server" | "client";
+  connected: boolean;
+  serverInfo: {
+    serverId: string;
+    serverIp: string | null;
+    serverPort: number;
+    hostname: string | null;
+  } | null;
+  clients: Array<{
+    clientId: string | null;
+    hostname: string | null;
+    role: string;
+    connectedAt: number;
+    rttMs: number | null;
+  }>;
+  stateVersion: number;
+}
+
+export interface NetworkStateEnvelope {
+  kind: "full";
+  state: unknown;
+  stateVersion: number;
+}
+
+export interface NetworkActionEnvelope {
+  actionId: string;
+  actionType: string;
+  area?: number;
+  payload?: Record<string, unknown>;
+  clientId?: string;
+  ts?: number;
+}
+
+export interface NetworkAckEnvelope { actionId: string; newVersion: number; }
+export interface NetworkRejectedEnvelope {
+  actionId: string;
+  reason: string;
+  message?: string;
+}
+
+export interface DiscoveredServer {
+  serverId: string;
+  serverIp: string;
+  serverPort: number;
+  appVersion?: string;
+  tournamentName?: string | null;
+  startedAt?: number;
+}
+
 declare global {
   interface Window {
     __KARATE__?: {
@@ -25,6 +75,25 @@ declare global {
         onChange: (cb: (envelope: { state: unknown; token: string | null }) => void) => () => void;
       };
       openPublicWindow?: () => void;
+      overlay?: {
+        onOpen(cb: (payload: { localAdminToken: string; serverUrl: string }) => void): () => void;
+        onClose(cb: () => void): () => void;
+        requestClose(): Promise<{ ok: boolean }>;
+      };
+      network?: {
+        getStatus(): Promise<NetworkStatusSnapshot>;
+        setMode(mode: "standalone" | "server" | "client"): Promise<{ ok: boolean; needsImport?: boolean; error?: string }>;
+        importLocalState(state: unknown): Promise<{ ok: boolean; error?: string }>;
+        sendAction(action: NetworkActionEnvelope): Promise<{ ok: boolean; error?: string }>;
+        listDiscoveredServers(): Promise<DiscoveredServer[]>;
+        connectTo(serverId: string): Promise<{ ok: boolean; error?: string }>;
+        disconnectAllClients(): Promise<{ ok: boolean }>;
+        onState(cb: (envelope: NetworkStateEnvelope) => void): () => void;
+        onStatus(cb: (status: NetworkStatusSnapshot) => void): () => void;
+        onAck(cb: (envelope: NetworkAckEnvelope) => void): () => void;
+        onRejected(cb: (envelope: NetworkRejectedEnvelope) => void): () => void;
+        onRivalServer(cb: (server: DiscoveredServer) => void): () => void;
+      };
     };
   }
 }

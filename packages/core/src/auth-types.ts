@@ -2,6 +2,15 @@
 // mirrors it so consumers in the web app stay typed without importing the
 // server package.
 
+/**
+ * Claim-code roles. As of the stealth-chord rewrite all newly-issued claim
+ * codes are `referee`-only. `superadmin` is kept on the type so legacy JWTs
+ * from prior versions still decode without throwing, but no code path now
+ * mints a superadmin token; admin operations are gated by the local
+ * elevation token on the desktop client.
+ *
+ * @deprecated `"superadmin"` — kept for backwards compatibility only.
+ */
 export type Role = "superadmin" | "referee";
 
 export type Feature =

@@ -23,6 +23,9 @@ const fs = require("fs");
 
 const licensing = require("./licensing");
 const { fetchPublicKey } = require("./licensing/server-client");
+const localAdminToken = require("./local-admin-token");
+const stealthChord = require("./stealth-chord");
+const network = require("./network");
 
 const isPackaged = app.isPackaged;
 const ROOT = __dirname;
@@ -78,7 +81,12 @@ async function startServer() {
   const { createServer } = resolveServerModule();
   const staticDir = resolveStaticDir();
   const launchConfig = readLaunchConfig();
-  serverHandle = await createServer({ staticDir, port: 0, launchConfig });
+  serverHandle = await createServer({
+    staticDir,
+    port: 0,
+    launchConfig,
+    localAdminToken: localAdminToken.getter(),
+  });
   const { url, port } = await serverHandle.start();
   serverUrl = url;
   kioskSession = serverHandle.kioskSession ?? null;
@@ -175,6 +183,7 @@ function createPrimaryWindow() {
   primaryWindow.loadURL(serverUrl);
   primaryWindow.webContents.on("did-finish-load", () => broadcastState());
   primaryWindow.on("closed", () => { primaryWindow = null; });
+  stealthChord.attach(primaryWindow.webContents);
 }
 
 function createPublicWindow() {
@@ -202,11 +211,31 @@ function createPublicWindow() {
   publicWindow.loadURL(serverUrl + "/public");
   publicWindow.webContents.on("did-finish-load", () => broadcastState());
   publicWindow.on("closed", () => { publicWindow = null; });
+  stealthChord.attach(publicWindow.webContents);
   return publicWindow;
+}
+
+function emitOverlayOpen() {
+  if (!primaryWindow || primaryWindow.isDestroyed()) return;
+  try { primaryWindow.focus(); } catch { /* ignore */ }
+  primaryWindow.webContents.send("karate:overlay-open", {
+    localAdminToken: localAdminToken.get(),
+    serverUrl,
+  });
+  stealthChord.setOverlayOpen(true);
+}
+
+function emitOverlayClose() {
+  if (primaryWindow && !primaryWindow.isDestroyed()) {
+    primaryWindow.webContents.send("karate:overlay-close");
+  }
+  stealthChord.setOverlayOpen(false);
 }
 
 app.whenReady().then(async () => {
   try {
+    localAdminToken.init();
+    stealthChord.init({ onOpen: emitOverlayOpen, onClose: emitOverlayClose });
     await startServer();
     machineFp = licensing.getMachineFingerprint(app.getPath("userData"));
     licensingUrl = process.env.KARATE_LICENSING_URL || serverUrl;
@@ -275,16 +304,29 @@ app.whenReady().then(async () => {
     return true;
   });
 
+  ipcMain.handle("karate:overlay-close-request", () => {
+    emitOverlayClose();
+    return { ok: true };
+  });
+
   createPrimaryWindow();
+  await network.create({
+    userDataPath: app.getPath("userData"),
+    mainWindow: primaryWindow,
+  });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createPrimaryWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createPrimaryWindow();
+      network.setMainWindow(primaryWindow);
+    }
   });
 });
 
 app.on("window-all-closed", async () => {
   if (process.platform !== "darwin") {
     if (renewTimer) clearTimeout(renewTimer);
+    try { await network.shutdown(); } catch { /* ignore */ }
     if (serverHandle) {
       try { await serverHandle.stop(); } catch { /* ignore */ }
     }
@@ -294,6 +336,7 @@ app.on("window-all-closed", async () => {
 
 app.on("before-quit", async () => {
   if (renewTimer) clearTimeout(renewTimer);
+  try { await network.shutdown(); } catch { /* ignore */ }
   if (serverHandle) {
     try { await serverHandle.stop(); } catch { /* ignore */ }
   }

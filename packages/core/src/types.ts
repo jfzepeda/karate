@@ -183,6 +183,15 @@ export interface TimerState {
   remaining: number;
   running: boolean;
   finished: boolean;
+  /**
+   * Server-authoritative transition markers. Set by the network controller's
+   * timer tick (or by the standalone tick in `apps/web/lib/store.tsx`) when
+   * the 15-second warning and end-of-time events fire. Renderers watch for
+   * value changes on these to play their local beeps without running their
+   * own countdown.
+   */
+  warnedAt?: number;
+  expiredAt?: number;
 }
 
 export type CommandKey =

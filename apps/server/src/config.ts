@@ -43,7 +43,8 @@ export function defaultConfig(overrides: Partial<ServerConfig> = {}): ServerConf
     staticDir: overrides.staticDir ?? null,
     launchConfig: overrides.launchConfig ?? null,
     seedClaimCodes: overrides.seedClaimCodes ?? [
-      { code: "482719", role: "superadmin", features: FULL_SUPERADMIN, label: "Dev Superadmin" },
+      // All seeds are referee-only. Superadmin access is granted exclusively
+      // via the local stealth chord on the desktop client.
       { code: "305847", role: "referee", features: FULL_REFEREE, label: "Test Referee 1" },
       { code: "671234", role: "referee", features: FULL_REFEREE, label: "Test Referee 2" },
       { code: "918273", role: "referee", features: FULL_REFEREE, label: "Test Referee 3" },

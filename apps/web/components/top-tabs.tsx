@@ -5,11 +5,12 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
 import { isElectron, apiGetDownloadInfo, apiPrepareDownload, getServerUrl, type DownloadInfo } from "@/lib/api-client";
+import { NetworkStatusBadge } from "@/components/network-status-badge";
 
 export function TopTabs() {
   const pathname = usePathname() || "/";
   const router = useRouter();
-  const { status, user, logout, isKiosk } = useAuth();
+  const { status, logout, isKiosk } = useAuth();
   const [downloads, setDownloads] = useState<DownloadInfo | null>(null);
   const [downloading, setDownloading] = useState(false);
 
@@ -43,19 +44,13 @@ export function TopTabs() {
     return null;
   }
 
-  const role = user?.role;
-  const tabs: { href: string; label: string; external?: boolean }[] = [];
-
-  if (role === "superadmin") {
-    tabs.push({ href: "/superadmin", label: "Configure" });
-    tabs.push({ href: "/admin", label: "Admin" });
-    tabs.push({ href: "/private", label: "Private" });
-    tabs.push({ href: "/public", label: "Public ↗", external: true });
-  } else if (role === "referee") {
-    tabs.push({ href: "/admin", label: "Admin" });
-    tabs.push({ href: "/private", label: "Private" });
-    tabs.push({ href: "/public", label: "Public ↗", external: true });
-  }
+  // All claim codes are referee-only. Tournament configuration is reached via
+  // the stealth chord overlay, not a top-tab.
+  const tabs: { href: string; label: string; external?: boolean }[] = [
+    { href: "/admin", label: "Admin" },
+    { href: "/private", label: "Private" },
+    { href: "/public", label: "Public ↗", external: true },
+  ];
 
   return (
     <nav id="tabs">
@@ -97,8 +92,9 @@ export function TopTabs() {
         );
       })}
       <span className="brand">KARATE TOURNAMENT</span>
-      <span style={{ marginLeft: "auto", display: "inline-flex", gap: 8, alignItems: "center" }}>
-        {role === "referee" && !isKiosk ? (
+      <span style={{ marginLeft: "auto", display: "inline-flex", gap: 12, alignItems: "center" }}>
+        <NetworkStatusBadge variant="inline" />
+        {!isKiosk ? (
           <button
             type="button"
             className="topbar-link"
