@@ -256,27 +256,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // ---- STANDALONE-only timer tick (mirrors the legacy owner-elected loop) ----
   useEffect(() => {
     if (mode !== "standalone") return;
-    const onPathChange = () => {
-      if (typeof window === "undefined") return;
-      if (window.location.pathname.startsWith("/private")) {
-        window.localStorage.setItem(TIMER_OWNER_KEY, TAB_ID);
-      }
-    };
-    onPathChange();
-    window.addEventListener("popstate", onPathChange);
-    return () => window.removeEventListener("popstate", onPathChange);
-  }, [mode]);
-
-  useEffect(() => {
-    if (mode !== "standalone") return;
     const id = setInterval(() => {
       if (typeof window === "undefined") return;
       if (!window.location.pathname.startsWith("/private")) return;
+
+      // Heartbeat-based ownership: steal if stored owner has not written a heartbeat
+      // in the last 2.5 s (handles stale keys from previous sessions and pushState
+      // navigation that never fires popstate).
+      const now = Date.now();
       const owner = window.localStorage.getItem(TIMER_OWNER_KEY);
       if (owner !== TAB_ID) {
-        if (owner !== null) return;
+        const hb = parseInt(window.localStorage.getItem("karate-timer-hb-v5") ?? "0", 10);
+        if (now - hb < 2500) return; // Another tab is actively ticking
         window.localStorage.setItem(TIMER_OWNER_KEY, TAB_ID);
       }
+      window.localStorage.setItem("karate-timer-hb-v5", String(now));
+
       const cur = localStateRef.current;
       const t = cur.timer;
       if (!t.running || t.remaining <= 0) return;

@@ -21,8 +21,13 @@ function shouldBlink(state: AppState): "blue" | "red" | null {
       m.redEliminated);
   const elimKata = isKata && (m.blueEliminated || m.redEliminated);
   const finished = state.timer.finished && !isKata;
-  if (!fiveOut && !finished && !elimKata) return null;
-  return computeWinner(m);
+  const threshold = state.tournament?.settings?.pointDifference ?? 0;
+  const pointWin =
+    !isKata &&
+    threshold > 0 &&
+    Math.abs(m.bluePoints - m.redPoints) >= threshold;
+  if (!fiveOut && !finished && !elimKata && !pointWin) return null;
+  return computeWinner(m, threshold > 0 ? threshold : undefined);
 }
 
 interface Props {
