@@ -6,6 +6,7 @@ import {
 import type {
   AuthUser, Role, LicenseState, LicensePublic, LicenseDegradedReason,
 } from "@karate/core";
+import type { ConnectTarget } from "./api-client";
 import { apiActivate, apiRenewToken, apiMe, ApiError } from "./api-client";
 
 /**
@@ -25,11 +26,19 @@ const TOKEN_KEY = "karate.session.jwt";       // sessionStorage — survives rel
 const STATE_KEY = "karate.session.state";     // sessionStorage — for browser-only mode
 const FP_KEY = "karate.browser.fp";
 
+export interface GuestSessionInfo {
+  serverId: string | null;
+  serverIp: string | null;
+  serverPort: number | null;
+  clientId: string | null;
+}
+
 export type AuthStatus =
   | { kind: "loading" }
   | { kind: "anonymous" }
   | { kind: "authed"; session: { user: AuthUser; expiresAt: number; issuedAt: number; token: string }; license: LicensePublic; isGrace: boolean; graceRemainingMs: number }
-  | { kind: "locked"; reason: LicenseDegradedReason };
+  | { kind: "locked"; reason: LicenseDegradedReason }
+  | { kind: "guest"; user: AuthUser; session: GuestSessionInfo };
 
 interface AuthApi {
   status: AuthStatus;
@@ -44,6 +53,11 @@ interface AuthApi {
   redeemCode(code: string): Promise<void>;
   retryRenewal(): Promise<void>;
   hasRole(role: Role | Role[]): boolean;
+  /** Join a host on the LAN as a guest. Resolves once the host approves
+   *  (WELCOME received) and rejects on denial / timeout / connection failure. */
+  joinAsGuest(target: ConnectTarget): Promise<void>;
+  /** Leave a host session and return to standalone/anonymous. */
+  leaveGuest(): Promise<void>;
 }
 
 const AuthContext = createContext<AuthApi | null>(null);
@@ -111,6 +125,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [licenseState, setLicenseState] = useState<LicenseState>({ kind: "unlicensed" });
   const [token, setToken] = useState<string | null>(null);
   const [machineFp, setMachineFp] = useState<string | null>(null);
+  const [guestSession, setGuestSession] = useState<GuestSessionInfo | null>(null);
   const isKioskRef = useRef(false);
   const [status, setStatus] = useState<AuthStatus>({ kind: "loading" });
 
@@ -199,10 +214,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => { mounted = false; };
   }, []);
 
-  // Recompute the renderer-facing status whenever inputs change.
+  // Subscribe to network status — a welcomed client connection means this
+  // device has been approved by a host and should run in "guest" mode,
+  // bypassing the per-device license check.
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const net = window.__KARATE__?.network;
+    if (!net) return;
+    let cancelled = false;
+    net.getStatus().then((s) => {
+      if (cancelled) return;
+      if (s.mode === "client" && s.welcomed && s.serverInfo) {
+        setGuestSession({
+          serverId: s.serverInfo.serverId,
+          serverIp: s.serverInfo.serverIp,
+          serverPort: s.serverInfo.serverPort,
+          clientId: null,
+        });
+      }
+    }).catch(() => {});
+    const offStatus = net.onStatus((s) => {
+      if (s.mode === "client" && s.welcomed && s.serverInfo) {
+        setGuestSession((prev) => ({
+          serverId: s.serverInfo!.serverId,
+          serverIp: s.serverInfo!.serverIp,
+          serverPort: s.serverInfo!.serverPort,
+          clientId: prev?.clientId ?? null,
+        }));
+      } else if (s.mode !== "client") {
+        setGuestSession(null);
+      } else if (!s.welcomed) {
+        // Still in client mode but lost the welcomed state (host gone).
+        // Keep guestSession until disconnect surfaces via the rejection
+        // channel or the user explicitly leaves — otherwise a transient
+        // reconnect cycle would flap the auth status.
+      }
+    });
+    return () => { cancelled = true; offStatus(); };
+  }, []);
+
+  // Recompute the renderer-facing status whenever inputs change. Guest
+  // takes precedence over the license-derived status.
+  useEffect(() => {
+    if (guestSession) {
+      setStatus({
+        kind: "guest",
+        user: { role: "referee", features: ["scoring", "bracket_view", "public_display"] },
+        session: guestSession,
+      });
+      return;
+    }
     setStatus(statusFromState(licenseState, token));
-  }, [licenseState, token]);
+  }, [licenseState, token, guestSession]);
 
   // Heartbeat — detect revocation within 30 s without waiting for renewal.
   useEffect(() => {
@@ -308,10 +371,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await login(code);
   }, [login]);
 
+  const joinAsGuest = useCallback(async (target: ConnectTarget): Promise<void> => {
+    const net = typeof window !== "undefined" ? window.__KARATE__?.network : null;
+    if (!net) throw new Error("network_unavailable");
+    const setRes = await net.setMode("client");
+    if (!setRes.ok) throw new Error(setRes.error || "set_mode_failed");
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup: Array<() => void> = [];
+      const finishOk = () => {
+        if (settled) return;
+        settled = true;
+        cleanup.forEach((fn) => fn());
+        resolve();
+      };
+      const finishErr = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup.forEach((fn) => fn());
+        reject(err);
+      };
+      cleanup.push(net.onStatus((s) => {
+        if (s.mode === "client" && s.welcomed) finishOk();
+      }));
+      cleanup.push(net.onConnectionRejected((env) => {
+        finishErr(new Error(env.reason || "rejected"));
+      }));
+      // Belt-and-braces timeout — server enforces 60s, give the renderer
+      // 75s to receive the message before bailing out.
+      const t = setTimeout(() => finishErr(new Error("timeout")), 75_000);
+      cleanup.push(() => clearTimeout(t));
+      net.connectTo(target).then((r) => {
+        if (!r.ok) finishErr(new Error(r.error || "connect_failed"));
+      }).catch((err) => finishErr(err instanceof Error ? err : new Error("connect_failed")));
+    });
+  }, []);
+
+  const leaveGuest = useCallback(async (): Promise<void> => {
+    const net = typeof window !== "undefined" ? window.__KARATE__?.network : null;
+    setGuestSession(null);
+    if (!net) return;
+    try { await net.disconnectClient(); } catch {}
+    try { await net.setMode("standalone"); } catch {}
+  }, []);
+
   const api: AuthApi = useMemo(() => {
+    const currentUser: AuthUser | null =
+      status.kind === "authed" ? status.session.user
+      : status.kind === "guest" ? status.user
+      : null;
     return {
       status,
-      user: status.kind === "authed" ? status.session.user : null,
+      user: currentUser,
       token: status.kind === "authed" ? status.session.token : null,
       isKiosk: isKioskRef.current,
       machineFingerprint: machineFp,
@@ -319,14 +430,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       graceRemainingMs:
         licenseState.kind === "grace" ? licenseState.graceRemainingMs : 0,
       login, logout, redeemCode, retryRenewal,
+      joinAsGuest, leaveGuest,
       hasRole(role) {
-        const u = status.kind === "authed" ? status.session.user : null;
-        if (!u) return false;
+        if (!currentUser) return false;
         const roles = Array.isArray(role) ? role : [role];
-        return roles.includes(u.role);
+        return roles.includes(currentUser.role);
       },
     };
-  }, [status, licenseState, machineFp, login, logout, redeemCode, retryRenewal]);
+  }, [status, licenseState, machineFp, login, logout, redeemCode, retryRenewal, joinAsGuest, leaveGuest]);
 
   return <AuthContext.Provider value={api}>{children}</AuthContext.Provider>;
 }

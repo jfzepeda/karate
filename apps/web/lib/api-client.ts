@@ -7,6 +7,9 @@ import type {
 export interface NetworkStatusSnapshot {
   mode: "standalone" | "server" | "client";
   connected: boolean;
+  /** Client mode: true once the host's WELCOME has been received (i.e. the
+   *  host approved this device). In server/standalone modes always true. */
+  welcomed: boolean;
   serverInfo: {
     serverId: string;
     serverIp: string | null;
@@ -20,8 +23,26 @@ export interface NetworkStatusSnapshot {
     connectedAt: number;
     rttMs: number | null;
   }>;
+  pending: PendingConnection[];
   stateVersion: number;
 }
+
+export interface PendingConnection {
+  clientId: string;
+  hostname: string;
+  ip: string;
+  role: string;
+  requestedAt: number;
+}
+
+export interface ConnectionRejectedEnvelope {
+  reason: "denied" | "timeout" | "kicked" | string;
+  target: { serverId: string; ip: string; port: number } | null;
+}
+
+export type ConnectTarget =
+  | string
+  | { serverId?: string; ip: string; port?: number };
 
 export interface NetworkStateEnvelope {
   kind: "full";
@@ -87,13 +108,19 @@ declare global {
         importLocalState(state: unknown): Promise<{ ok: boolean; error?: string }>;
         sendAction(action: NetworkActionEnvelope): Promise<{ ok: boolean; error?: string }>;
         listDiscoveredServers(): Promise<DiscoveredServer[]>;
-        connectTo(serverId: string): Promise<{ ok: boolean; error?: string }>;
+        connectTo(target: ConnectTarget): Promise<{ ok: boolean; error?: string }>;
         disconnectAllClients(): Promise<{ ok: boolean }>;
+        disconnectClient(): Promise<{ ok: boolean }>;
+        approveConnection(clientId: string): Promise<{ ok: boolean; error?: string }>;
+        rejectConnection(clientId: string, reason?: string): Promise<{ ok: boolean; error?: string }>;
+        listPending(): Promise<PendingConnection[]>;
         onState(cb: (envelope: NetworkStateEnvelope) => void): () => void;
         onStatus(cb: (status: NetworkStatusSnapshot) => void): () => void;
         onAck(cb: (envelope: NetworkAckEnvelope) => void): () => void;
         onRejected(cb: (envelope: NetworkRejectedEnvelope) => void): () => void;
         onRivalServer(cb: (server: DiscoveredServer) => void): () => void;
+        onConnectionRequest(cb: (req: PendingConnection) => void): () => void;
+        onConnectionRejected(cb: (envelope: ConnectionRejectedEnvelope) => void): () => void;
       };
     };
   }

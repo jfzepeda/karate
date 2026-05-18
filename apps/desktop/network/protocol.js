@@ -16,6 +16,7 @@ const MSG = Object.freeze({
   ACTION_REJECTED: "ACTION_REJECTED",
   PING: "PING",
   CLIENT_LIST: "CLIENT_LIST",
+  CONNECTION_REJECTED: "CONNECTION_REJECTED",
 
   // UDP discovery
   ANNOUNCE: "KARATE_SERVER_ANNOUNCE",
@@ -27,6 +28,7 @@ const DEFAULT_UDP_PORT = 4748;
 const ANNOUNCE_INTERVAL_MS = 2000;
 const SERVER_LOSS_MS = 6000;
 const PING_INTERVAL_MS = 10000;
+const PENDING_TIMEOUT_MS = 60000;
 
 function safeParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -40,5 +42,6 @@ module.exports = {
   ANNOUNCE_INTERVAL_MS,
   SERVER_LOSS_MS,
   PING_INTERVAL_MS,
+  PENDING_TIMEOUT_MS,
   safeParse,
 };

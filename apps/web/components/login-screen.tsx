@@ -1,7 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
+import type { DiscoveredServer } from "@/lib/api-client";
+import { GuestWaitingScreen } from "./guest-waiting-screen";
 
 const ERROR_COPY: Record<string, string> = {
   CODE_NOT_FOUND: "This code does not exist. Check for typos.",
@@ -14,11 +16,52 @@ const ERROR_COPY: Record<string, string> = {
   LOCAL_VERIFY_FAILED: "Server returned a token we could not verify. Contact support.",
 };
 
+const JOIN_ERROR_COPY: Record<string, string> = {
+  denied: "The host rejected the connection.",
+  timeout: "The host did not respond in time.",
+  kicked: "You were disconnected by the host.",
+  connect_failed: "Could not reach the host. Check the IP and that the host is running.",
+  network_unavailable: "Network features are only available in the desktop app.",
+  set_mode_failed: "Could not switch to client mode.",
+};
+
+type JoinTarget = { serverId: string | null; ip: string; port: number; label: string };
+
 export function LoginScreen() {
-  const { login } = useAuth();
+  const { login, joinAsGuest } = useAuth();
+  const isElectron =
+    typeof window !== "undefined" && !!window.__KARATE__?.network;
+
+  // ── activation form ──
   const [code, setCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ── join-host section ──
+  const [discovered, setDiscovered] = useState<DiscoveredServer[]>([]);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualIp, setManualIp] = useState("");
+  const [manualPort, setManualPort] = useState("4747");
+  const [joining, setJoining] = useState<JoinTarget | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
+
+  // Poll for discovered hosts while this screen is mounted. The desktop
+  // listener runs in standalone + client modes, so the list stays warm
+  // even before the user clicks anything.
+  useEffect(() => {
+    if (!isElectron) return;
+    const net = window.__KARATE__?.network;
+    if (!net) return;
+    let cancelled = false;
+    const refresh = () => {
+      net.listDiscoveredServers().then((list) => {
+        if (!cancelled) setDiscovered(list);
+      }).catch(() => {});
+    };
+    refresh();
+    const id = setInterval(refresh, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [isElectron]);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -31,8 +74,8 @@ export function LoginScreen() {
     try {
       await login(code);
     } catch (err) {
-      const code = err instanceof Error ? err.message : "unknown_error";
-      setError(ERROR_COPY[code] ?? "Could not connect to the activation server. Check your internet connection.");
+      const c = err instanceof Error ? err.message : "unknown_error";
+      setError(ERROR_COPY[c] ?? "Could not connect to the activation server. Check your internet connection.");
     } finally {
       setSubmitting(false);
     }
@@ -42,33 +85,179 @@ export function LoginScreen() {
     setCode(e.target.value.replace(/\D/g, "").slice(0, 6));
   }
 
+  const startJoin = useCallback(async (target: JoinTarget) => {
+    setJoinError(null);
+    setJoining(target);
+    try {
+      await joinAsGuest(target.serverId
+        ? target.serverId
+        : { ip: target.ip, port: target.port });
+    } catch (err) {
+      const c = err instanceof Error ? err.message : "connect_failed";
+      setJoinError(JOIN_ERROR_COPY[c] ?? `Could not join: ${c}`);
+      setJoining(null);
+    }
+  }, [joinAsGuest]);
+
+  function onJoinDiscovered(s: DiscoveredServer) {
+    startJoin({
+      serverId: s.serverId,
+      ip: s.serverIp,
+      port: s.serverPort,
+      label: s.tournamentName || s.serverIp,
+    });
+  }
+
+  function onJoinManual(e: React.FormEvent) {
+    e.preventDefault();
+    const ip = manualIp.trim();
+    const port = Number(manualPort) || 4747;
+    if (!/^[0-9.]+$/.test(ip)) {
+      setJoinError("Enter a valid IPv4 address (e.g. 192.168.1.10).");
+      return;
+    }
+    startJoin({ serverId: null, ip, port, label: `${ip}:${port}` });
+  }
+
+  if (joining) {
+    return (
+      <GuestWaitingScreen
+        target={joining}
+        onCancel={() => setJoining(null)}
+      />
+    );
+  }
+
   return (
     <div className="auth-screen">
-      <form className="auth-card" onSubmit={onSubmit}>
-        <h1>Karate Tournament</h1>
-        <p className="muted">Enter your 6-digit access code</p>
-        <input
-          autoFocus
-          value={code}
-          onChange={handleChange}
-          placeholder="000000"
-          maxLength={6}
-          inputMode="numeric"
-          autoComplete="one-time-code"
-          style={{
-            textAlign: "center",
-            letterSpacing: 10,
-            fontSize: 28,
-            width: "100%",
-            fontFamily: "ui-monospace, Menlo, monospace",
-          }}
-          disabled={submitting}
-        />
-        {error && <div className="auth-error">{error}</div>}
-        <button type="submit" className="primary" disabled={submitting || code.length !== 6}>
-          {submitting ? "Activating…" : "Activate"}
-        </button>
-      </form>
+      <div className="auth-card">
+        <form onSubmit={onSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <h1>Karate Tournament</h1>
+          <p className="muted">Enter your 6-digit access code</p>
+          <input
+            autoFocus
+            value={code}
+            onChange={handleChange}
+            placeholder="000000"
+            maxLength={6}
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            style={{
+              textAlign: "center",
+              letterSpacing: 10,
+              fontSize: 28,
+              width: "100%",
+              fontFamily: "ui-monospace, Menlo, monospace",
+            }}
+            disabled={submitting}
+          />
+          {error && <div className="auth-error">{error}</div>}
+          <button type="submit" className="primary" disabled={submitting || code.length !== 6}>
+            {submitting ? "Activating…" : "Activate"}
+          </button>
+        </form>
+
+        {isElectron && (
+          <div style={{ marginTop: 8 }}>
+            <div
+              aria-hidden
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                margin: "18px 0 10px",
+                color: "var(--muted, #8a93a6)",
+                fontSize: 11,
+                letterSpacing: "0.12em",
+                textTransform: "uppercase",
+              }}
+            >
+              <div style={{ flex: 1, height: 1, background: "var(--border, #2a3142)" }} />
+              <span>or join a host</span>
+              <div style={{ flex: 1, height: 1, background: "var(--border, #2a3142)" }} />
+            </div>
+
+            {joinError && <div className="auth-error" style={{ marginBottom: 10 }}>{joinError}</div>}
+
+            {discovered.length > 0 ? (
+              <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+                {discovered.map((s) => (
+                  <li
+                    key={s.serverId}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      padding: "10px 12px",
+                      background: "var(--panel-2, #1d2230)",
+                      border: "1px solid var(--border, #2a3142)",
+                      borderRadius: 8,
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 600 }}>
+                        {s.tournamentName || "Karate Host"}
+                      </div>
+                      <div className="muted small" style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>
+                        {s.serverIp}:{s.serverPort}
+                      </div>
+                    </div>
+                    <button type="button" className="primary" onClick={() => onJoinDiscovered(s)}>
+                      Connect
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted small" style={{ margin: 0 }}>
+                Looking for hosts on your network…
+              </p>
+            )}
+
+            <div style={{ marginTop: 14 }}>
+              {!manualOpen ? (
+                <button
+                  type="button"
+                  onClick={() => { setManualOpen(true); setJoinError(null); }}
+                  style={{ background: "transparent", border: "none", color: "var(--accent, #4f8cff)", cursor: "pointer", padding: 0, fontSize: 13 }}
+                >
+                  Enter IP manually
+                </button>
+              ) : (
+                <form onSubmit={onJoinManual} style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+                  <label style={{ flex: "2 1 160px" }}>
+                    IP address
+                    <input
+                      autoFocus
+                      value={manualIp}
+                      onChange={(e) => setManualIp(e.target.value)}
+                      placeholder="192.168.1.10"
+                      inputMode="decimal"
+                    />
+                  </label>
+                  <label style={{ flex: "1 1 80px", maxWidth: 100 }}>
+                    Port
+                    <input
+                      value={manualPort}
+                      onChange={(e) => setManualPort(e.target.value.replace(/\D/g, "").slice(0, 5))}
+                      inputMode="numeric"
+                    />
+                  </label>
+                  <button type="submit" className="primary">Connect</button>
+                  <button
+                    type="button"
+                    onClick={() => { setManualOpen(false); setManualIp(""); }}
+                    style={{ background: "transparent", border: "none", color: "var(--muted, #8a93a6)", cursor: "pointer", padding: "8px 4px", fontSize: 13 }}
+                  >
+                    Cancel
+                  </button>
+                </form>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import { TopTabs } from "@/components/top-tabs";
 import { JuryModal } from "@/components/jury-modal";
 import { BodyClassSync } from "@/components/body-class-sync";
 import { SuperadminOverlay } from "@/components/superadmin-overlay";
+import { ConnectionRequestModal } from "@/components/connection-request-modal";
 
 export const metadata: Metadata = {
   title: "Karate Tournament Scoring",
@@ -33,6 +34,7 @@ export default function RootLayout({
                   {children}
                   <JuryModal />
                   <SuperadminOverlay />
+                  <ConnectionRequestModal />
                 </AreaProvider>
               </OverlayProvider>
             </StoreProvider>

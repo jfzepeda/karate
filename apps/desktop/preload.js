@@ -56,6 +56,8 @@ const netStatusListeners = makeFanout();
 const netAckListeners = makeFanout();
 const netRejectedListeners = makeFanout();
 const netRivalListeners = makeFanout();
+const netConnReqListeners = makeFanout();
+const netConnRejListeners = makeFanout();
 ipcRenderer.on("karate:network-state", (_evt, payload) => {
   for (const cb of netStateListeners) { try { cb(payload); } catch {} }
 });
@@ -70,6 +72,12 @@ ipcRenderer.on("karate:network-action-rejected", (_evt, payload) => {
 });
 ipcRenderer.on("karate:network-rival-server", (_evt, payload) => {
   for (const cb of netRivalListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-connection-request", (_evt, payload) => {
+  for (const cb of netConnReqListeners) { try { cb(payload); } catch {} }
+});
+ipcRenderer.on("karate:network-connection-rejected", (_evt, payload) => {
+  for (const cb of netConnRejListeners) { try { cb(payload); } catch {} }
 });
 
 contextBridge.exposeInMainWorld("__KARATE__", {
@@ -133,8 +141,14 @@ contextBridge.exposeInMainWorld("__KARATE__", {
     importLocalState(state) { return ipcRenderer.invoke("karate:network-import-local-state", state); },
     sendAction(action) { return ipcRenderer.invoke("karate:network-send-action", action); },
     listDiscoveredServers() { return ipcRenderer.invoke("karate:network-list-discovered-servers"); },
-    connectTo(serverId) { return ipcRenderer.invoke("karate:network-connect-to", serverId); },
+    // `target` accepts either a discovered serverId (string) or an object
+    // { ip, port?, serverId? } for the manual-IP fallback.
+    connectTo(target) { return ipcRenderer.invoke("karate:network-connect-to", target); },
     disconnectAllClients() { return ipcRenderer.invoke("karate:network-disconnect-all-clients"); },
+    disconnectClient() { return ipcRenderer.invoke("karate:network-disconnect-client"); },
+    approveConnection(clientId) { return ipcRenderer.invoke("karate:network-approve-connection", clientId); },
+    rejectConnection(clientId, reason) { return ipcRenderer.invoke("karate:network-reject-connection", clientId, reason); },
+    listPending() { return ipcRenderer.invoke("karate:network-list-pending"); },
     onState(cb) {
       netStateListeners.add(cb);
       return () => netStateListeners.delete(cb);
@@ -154,6 +168,14 @@ contextBridge.exposeInMainWorld("__KARATE__", {
     onRivalServer(cb) {
       netRivalListeners.add(cb);
       return () => netRivalListeners.delete(cb);
+    },
+    onConnectionRequest(cb) {
+      netConnReqListeners.add(cb);
+      return () => netConnReqListeners.delete(cb);
+    },
+    onConnectionRejected(cb) {
+      netConnRejListeners.add(cb);
+      return () => netConnRejListeners.delete(cb);
     },
   },
 });

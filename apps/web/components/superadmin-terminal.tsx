@@ -835,7 +835,22 @@ export function SuperadminTerminal() {
           netStatus.clients.forEach((c) => {
             print("dim", `    ${c.hostname ?? "(unknown)"}  rtt:${c.rttMs ?? "?"}ms`);
           });
+          const pendingCount = netStatus.pending?.length ?? 0;
+          if (pendingCount > 0) {
+            print("hi", `  Pending: ${pendingCount} (use 'net pending')`);
+          }
           if (!isElectron) print("dim", "  (network only available in desktop app)");
+          return;
+        }
+        if (sub === "pending") {
+          if (!net) { print("err", "ERR: network not available (desktop only)"); return; }
+          const list = await net.listPending();
+          if (list.length === 0) { print("dim", "No pending connection requests."); return; }
+          print("dim", "  CLIENTID                  HOSTNAME             IP");
+          list.forEach((p) => {
+            print("out", `  ${p.clientId.slice(0, 24).padEnd(26)}${(p.hostname ?? "(unknown)").slice(0, 20).padEnd(21)}${p.ip}`);
+          });
+          print("dim", "  (use the modal to accept/reject)");
           return;
         }
         if (!net) { print("err", "ERR: network not available (desktop only)"); return; }

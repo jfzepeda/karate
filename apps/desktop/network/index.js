@@ -29,6 +29,7 @@ let announcer = null;
 let listener = null;
 let mode = "standalone";
 let lastClients = [];
+let lastPending = [];
 
 function send(channel, payload) {
   if (mainWindowRef && !mainWindowRef.isDestroyed()) {
@@ -74,6 +75,7 @@ function getStatus() {
     return {
       mode,
       connected: true,
+      welcomed: true,
       serverInfo: server ? {
         serverId: server.getServerId(),
         serverIp: pickServerIp(),
@@ -81,14 +83,16 @@ function getStatus() {
         hostname: os.hostname(),
       } : null,
       clients: lastClients,
+      pending: lastPending,
       stateVersion: store?.getVersion() ?? 0,
     };
   }
   if (mode === "client") {
-    const st = client?.status() ?? { connected: false, target: null, stateVersion: 0 };
+    const st = client?.status() ?? { connected: false, welcomed: false, target: null, stateVersion: 0 };
     return {
       mode,
       connected: !!st.connected,
+      welcomed: !!st.welcomed,
       serverInfo: st.target
         ? {
             serverId: st.target.serverId,
@@ -98,14 +102,17 @@ function getStatus() {
           }
         : null,
       clients: [],
+      pending: [],
       stateVersion: store?.getVersion() ?? 0,
     };
   }
   return {
     mode,
     connected: false,
+    welcomed: false,
     serverInfo: null,
     clients: [],
+    pending: [],
     stateVersion: store?.getVersion() ?? 0,
   };
 }
@@ -135,6 +142,13 @@ async function startServerMode() {
       lastClients = list;
       pushStatus();
     },
+    onPendingChanged: (list) => {
+      lastPending = list;
+      pushStatus();
+    },
+    onConnectionRequest: (req) => {
+      send("karate:network-connection-request", req);
+    },
     appVersion: APP_VERSION,
     tournamentName: getTournamentName,
   });
@@ -157,16 +171,15 @@ function startClientMode() {
     onStatus: () => pushStatus(),
     onAck: (msg) => send("karate:network-action-ack", msg),
     onRejected: (msg) => send("karate:network-action-rejected", msg),
+    onConnectionRejected: (msg) => send("karate:network-connection-rejected", msg),
   });
+  // Client mode does NOT auto-connect on first announce — the user
+  // explicitly picks a host from the LoginScreen. Listener still runs so
+  // the discovered-server list stays warm.
   listener = makeListener({
     onAnnounce: (ann) => {
-      const current = client.getTarget();
-      if (!current) {
-        // Auto-connect on first sighting.
-        client.connectTo({ serverId: ann.serverId, ip: ann.serverIp, port: ann.serverPort });
-        cfg.lastKnownServerId = ann.serverId;
-        networkConfig.save(userDataPath, cfg);
-      } else if (current.serverId !== ann.serverId) {
+      const current = client?.getTarget();
+      if (current && current.serverId !== ann.serverId) {
         send("karate:network-rival-server", ann);
       }
     },
@@ -194,6 +207,7 @@ async function stopAll() {
   if (persister) { try { persister.flushNow(); } catch {} persister = null; }
   store = null;
   lastClients = [];
+  lastPending = [];
 }
 
 async function setMode(nextMode) {
@@ -284,16 +298,51 @@ function listDiscoveredServers() {
   return listener.listDiscovered();
 }
 
-function connectTo(serverId) {
-  if (mode !== "client" || !client || !listener) return { ok: false };
-  const ann = listener.listDiscovered().find((a) => a.serverId === serverId);
-  if (!ann) return { ok: false, error: "not_found" };
-  client.connectTo({ serverId, ip: ann.serverIp, port: ann.serverPort });
-  return { ok: true };
+function connectTo(arg) {
+  if (mode !== "client" || !client) return { ok: false, error: "not_client" };
+  // Accept either a serverId string (discovered) or { ip, port, serverId? }
+  // (manual fallback when UDP discovery is unavailable).
+  if (typeof arg === "string") {
+    const ann = listener?.listDiscovered().find((a) => a.serverId === arg);
+    if (!ann) return { ok: false, error: "not_found" };
+    cfg.lastKnownServerId = ann.serverId;
+    networkConfig.save(userDataPath, cfg);
+    client.connectTo({ serverId: ann.serverId, ip: ann.serverIp, port: ann.serverPort });
+    return { ok: true };
+  }
+  if (arg && typeof arg === "object" && typeof arg.ip === "string") {
+    const port = Number(arg.port) || DEFAULT_WS_PORT;
+    const serverId = typeof arg.serverId === "string" ? arg.serverId : `manual:${arg.ip}:${port}`;
+    client.connectTo({ serverId, ip: arg.ip, port });
+    return { ok: true };
+  }
+  return { ok: false, error: "invalid_target" };
 }
 
 function disconnectAllClients() {
   if (mode === "server" && server) server.disconnectAll();
+}
+
+function approveConnection(clientId) {
+  if (mode !== "server" || !server) return { ok: false, error: "not_server" };
+  return server.approveConnection(clientId);
+}
+
+function rejectConnection(clientId, reason) {
+  if (mode !== "server" || !server) return { ok: false, error: "not_server" };
+  return server.rejectConnection(clientId, reason);
+}
+
+function listPending() {
+  if (mode !== "server" || !server) return [];
+  return server.getPendingList();
+}
+
+function disconnectClient() {
+  // Renderer-driven leave for the guest side.
+  if (mode === "client" && client) {
+    try { client.disconnect(); } catch {}
+  }
 }
 
 async function create({ userDataPath: udp, mainWindow }) {
@@ -307,11 +356,18 @@ async function create({ userDataPath: udp, mainWindow }) {
   ipcMain.handle("karate:network-import-local-state", (_e, s) => importLocalState(s));
   ipcMain.handle("karate:network-send-action", (_e, a) => sendAction(a));
   ipcMain.handle("karate:network-list-discovered-servers", () => listDiscoveredServers());
-  ipcMain.handle("karate:network-connect-to", (_e, id) => connectTo(id));
+  ipcMain.handle("karate:network-connect-to", (_e, target) => connectTo(target));
   ipcMain.handle("karate:network-disconnect-all-clients", () => {
     disconnectAllClients();
     return { ok: true };
   });
+  ipcMain.handle("karate:network-disconnect-client", () => {
+    disconnectClient();
+    return { ok: true };
+  });
+  ipcMain.handle("karate:network-approve-connection", (_e, clientId) => approveConnection(clientId));
+  ipcMain.handle("karate:network-reject-connection", (_e, clientId, reason) => rejectConnection(clientId, reason));
+  ipcMain.handle("karate:network-list-pending", () => listPending());
 
   if (cfg.mode === "server") await startServerMode().then(() => { mode = "server"; });
   else if (cfg.mode === "client") { startClientMode(); mode = "client"; }

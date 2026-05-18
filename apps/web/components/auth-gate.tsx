@@ -70,6 +70,23 @@ export function AuthGate({ children, roles, allowAnonymous, isPublicView }: Prop
     return <LockScreen reason={status.reason as LicenseDegradedReason} />;
   }
 
+  // Guest mode — device joined a host on the LAN; the host's license
+  // covers this session. Render children directly (no grace banner, no
+  // license-derived role gating).
+  if (status.kind === "guest") {
+    if (roles && !hasRole(roles)) {
+      return (
+        <div className="auth-screen">
+          <div className="auth-card auth-locked">
+            <h1>Restricted</h1>
+            <p>This area is only available to {roles.join(" / ")}.</p>
+          </div>
+        </div>
+      );
+    }
+    return <>{children}</>;
+  }
+
   if (roles && !hasRole(roles)) {
     return (
       <div className="auth-screen">

@@ -29,8 +29,10 @@ export interface NetworkApi {
 const DEFAULT_STATUS: NetworkStatusSnapshot = {
   mode: "standalone",
   connected: false,
+  welcomed: false,
   serverInfo: null,
   clients: [],
+  pending: [],
   stateVersion: 0,
 };
 

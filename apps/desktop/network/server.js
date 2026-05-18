@@ -10,6 +10,7 @@ const {
   PROTOCOL_VERSION,
   DEFAULT_WS_PORT,
   PING_INTERVAL_MS,
+  PENDING_TIMEOUT_MS,
   safeParse,
 } = require("./protocol");
 const { ActionRejectedError } = require("./state-store");
@@ -21,6 +22,8 @@ function makeServer({
   persister,
   port = DEFAULT_WS_PORT,
   onClientsChanged,
+  onConnectionRequest,
+  onPendingChanged,
   appVersion,
   tournamentName,
 }) {
@@ -29,6 +32,7 @@ function makeServer({
   let pingInterval = null;
   let prevTimerRemaining = store.getState().timer.remaining;
   const clients = new Map(); // ws → meta
+  const approvedClientIds = new Set(); // clientIds approved this session
   const serverId = crypto.randomUUID();
 
   function broadcastState() {
@@ -39,7 +43,8 @@ function makeServer({
       stateVersion: version,
       state: snapshot,
     });
-    for (const [ws] of clients) {
+    for (const [ws, meta] of clients) {
+      if (meta.status !== "approved") continue;
       if (ws.readyState !== ws.OPEN) continue;
       if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
         try { ws.terminate(); } catch {}
@@ -51,20 +56,93 @@ function makeServer({
   }
 
   function sendClientList() {
-    const list = Array.from(clients.values()).map((c) => ({
-      clientId: c.clientId,
-      hostname: c.hostname,
-      role: c.role,
-      connectedAt: c.connectedAt,
-      rttMs: c.rttMs ?? null,
-    }));
+    const list = Array.from(clients.values())
+      .filter((c) => c.status === "approved")
+      .map((c) => ({
+        clientId: c.clientId,
+        hostname: c.hostname,
+        role: c.role,
+        connectedAt: c.connectedAt,
+        rttMs: c.rttMs ?? null,
+      }));
     if (typeof onClientsChanged === "function") onClientsChanged(list);
     const msg = JSON.stringify({ type: MSG.CLIENT_LIST, clients: list });
-    for (const [ws] of clients) {
+    for (const [ws, meta] of clients) {
+      if (meta.status !== "approved") continue;
       if (ws.readyState === ws.OPEN) {
         try { ws.send(msg); } catch {}
       }
     }
+  }
+
+  function getPendingList() {
+    return Array.from(clients.values())
+      .filter((c) => c.status === "pending")
+      .map((c) => ({
+        clientId: c.clientId,
+        hostname: c.hostname,
+        ip: c.ip,
+        role: c.role,
+        requestedAt: c.requestedAt,
+      }));
+  }
+
+  function notifyPending() {
+    if (typeof onPendingChanged === "function") {
+      try { onPendingChanged(getPendingList()); } catch {}
+    }
+  }
+
+  function findWsByClientId(clientId) {
+    for (const [ws, meta] of clients) {
+      if (meta.clientId === clientId) return { ws, meta };
+    }
+    return null;
+  }
+
+  function sendWelcome(ws, meta) {
+    try { ws.send(JSON.stringify({
+      type: MSG.WELCOME,
+      serverId,
+      protocolVersion: PROTOCOL_VERSION,
+      appVersion,
+      stateVersion: store.getVersion(),
+      state: store.getState(),
+      clientId: meta.clientId,
+      now: Date.now(),
+    })); } catch {}
+  }
+
+  function approveConnection(clientId) {
+    const hit = findWsByClientId(clientId);
+    if (!hit) return { ok: false, error: "not_found" };
+    const { ws, meta } = hit;
+    if (meta.status !== "pending") return { ok: false, error: "not_pending" };
+    if (meta.pendingTimeout) {
+      clearTimeout(meta.pendingTimeout);
+      meta.pendingTimeout = null;
+    }
+    meta.status = "approved";
+    approvedClientIds.add(clientId);
+    sendWelcome(ws, meta);
+    sendClientList();
+    notifyPending();
+    return { ok: true };
+  }
+
+  function rejectConnection(clientId, reason = "denied") {
+    const hit = findWsByClientId(clientId);
+    if (!hit) return { ok: false, error: "not_found" };
+    const { ws, meta } = hit;
+    if (meta.pendingTimeout) {
+      clearTimeout(meta.pendingTimeout);
+      meta.pendingTimeout = null;
+    }
+    try { ws.send(JSON.stringify({ type: MSG.CONNECTION_REJECTED, reason })); } catch {}
+    try { ws.close(); } catch {}
+    clients.delete(ws);
+    notifyPending();
+    return { ok: true };
   }
 
   function handleAction(ws, meta, action) {
@@ -130,6 +208,7 @@ function makeServer({
     pingInterval = setInterval(() => {
       for (const [ws, meta] of clients) {
         if (ws.readyState !== ws.OPEN) continue;
+        if (meta.status !== "approved") continue;
         const now = Date.now();
         meta.pingSentAt = now;
         try { ws.send(JSON.stringify({ type: MSG.PING, ts: now })); } catch {}
@@ -166,12 +245,19 @@ function makeServer({
       wss.on("error", (err) => {
         console.warn("[karate-network] ws server error:", err.message);
       });
-      wss.on("connection", (ws) => {
+      wss.on("connection", (ws, request) => {
+        const rawIp = request?.socket?.remoteAddress || "";
+        // Normalize ::ffff:192.168.x.x → 192.168.x.x for display.
+        const ip = rawIp.startsWith("::ffff:") ? rawIp.slice(7) : rawIp;
         const meta = {
           clientId: null,
           hostname: null,
+          ip,
           role: "referee",
+          status: "awaiting-hello",  // "awaiting-hello" → "pending" → "approved"
           connectedAt: Date.now(),
+          requestedAt: 0,
+          pendingTimeout: null,
           rttMs: null,
           pingSentAt: 0,
         };
@@ -180,22 +266,45 @@ function makeServer({
           const msg = safeParse(data.toString("utf8"));
           if (!msg) return;
           if (msg.type === MSG.HELLO) {
+            // Idempotent: re-HELLO from an already-approved socket is a no-op.
+            if (meta.status === "approved") return;
             meta.clientId = String(msg.clientId || crypto.randomUUID());
             meta.hostname = String(msg.hostname || "(unknown)");
             meta.role = msg.role === "superadmin" ? "superadmin" : "referee";
-            try { ws.send(JSON.stringify({
-              type: MSG.WELCOME,
-              serverId,
-              protocolVersion: PROTOCOL_VERSION,
-              appVersion,
-              stateVersion: store.getVersion(),
-              state: store.getState(),
-              clientId: meta.clientId,
-              now: Date.now(),
-            })); } catch {}
-            sendClientList();
+            meta.requestedAt = Date.now();
+            // Previously-approved client in this session → auto-approve (no
+            // re-prompt for renderers that reconnect within the same run).
+            if (approvedClientIds.has(meta.clientId)) {
+              meta.status = "approved";
+              sendWelcome(ws, meta);
+              sendClientList();
+              return;
+            }
+            meta.status = "pending";
+            meta.pendingTimeout = setTimeout(() => {
+              if (meta.status !== "pending") return;
+              try { ws.send(JSON.stringify({
+                type: MSG.CONNECTION_REJECTED,
+                reason: "timeout",
+              })); } catch {}
+              try { ws.close(); } catch {}
+              clients.delete(ws);
+              notifyPending();
+            }, PENDING_TIMEOUT_MS);
+            if (typeof onConnectionRequest === "function") {
+              try { onConnectionRequest({
+                clientId: meta.clientId,
+                hostname: meta.hostname,
+                ip: meta.ip,
+                role: meta.role,
+                requestedAt: meta.requestedAt,
+              }); } catch {}
+            }
+            notifyPending();
             return;
           }
+          // All other messages require an approved client.
+          if (meta.status !== "approved") return;
           if (msg.type === MSG.ACTION) {
             handleAction(ws, meta, msg);
             return;
@@ -216,12 +325,24 @@ function makeServer({
           }
         });
         ws.on("close", () => {
+          if (meta.pendingTimeout) {
+            clearTimeout(meta.pendingTimeout);
+            meta.pendingTimeout = null;
+          }
+          const wasPending = meta.status === "pending";
           clients.delete(ws);
-          sendClientList();
+          if (wasPending) notifyPending();
+          else sendClientList();
         });
         ws.on("error", () => {
+          if (meta.pendingTimeout) {
+            clearTimeout(meta.pendingTimeout);
+            meta.pendingTimeout = null;
+          }
+          const wasPending = meta.status === "pending";
           clients.delete(ws);
-          sendClientList();
+          if (wasPending) notifyPending();
+          else sendClientList();
         });
       });
     });
@@ -242,19 +363,27 @@ function makeServer({
   }
 
   function disconnectAll() {
-    for (const [ws] of clients) {
+    for (const [ws, meta] of clients) {
+      if (meta.pendingTimeout) {
+        clearTimeout(meta.pendingTimeout);
+        meta.pendingTimeout = null;
+      }
       try { ws.close(); } catch {}
     }
+    approvedClientIds.clear();
+    notifyPending();
   }
 
   function getClientList() {
-    return Array.from(clients.values()).map((c) => ({
-      clientId: c.clientId,
-      hostname: c.hostname,
-      role: c.role,
-      connectedAt: c.connectedAt,
-      rttMs: c.rttMs ?? null,
-    }));
+    return Array.from(clients.values())
+      .filter((c) => c.status === "approved")
+      .map((c) => ({
+        clientId: c.clientId,
+        hostname: c.hostname,
+        role: c.role,
+        connectedAt: c.connectedAt,
+        rttMs: c.rttMs ?? null,
+      }));
   }
 
   // Called when state was changed by a local (server-machine) renderer
@@ -268,6 +397,9 @@ function makeServer({
     stop,
     disconnectAll,
     getClientList,
+    getPendingList,
+    approveConnection,
+    rejectConnection,
     notifyLocalChange,
     getAnnounceInfo,
     getServerId() { return serverId; },

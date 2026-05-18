@@ -18,6 +18,7 @@ function makeClient({
   onStatus,
   onAck,
   onRejected,
+  onConnectionRejected,
 }) {
   let ws = null;
   let reconnectTimer = null;
@@ -25,10 +26,13 @@ function makeClient({
   let target = null;     // { serverId, ip, port }
   let lastState = null;
   let stateVersion = 0;
+  let wasRejected = false;
+  let welcomed = false;  // true once first WELCOME/FULL_STATE arrived
 
   function status() {
     return {
       connected,
+      welcomed,
       target: target ? { ...target } : null,
       stateVersion,
     };
@@ -60,6 +64,8 @@ function makeClient({
       ws = null;
     }
     target = { serverId, ip, port };
+    wasRejected = false;
+    welcomed = false;
     try {
       ws = new WebSocket(`ws://${ip}:${port}`);
     } catch (err) {
@@ -78,9 +84,23 @@ function makeClient({
       if (msg.type === MSG.WELCOME || msg.type === MSG.FULL_STATE) {
         lastState = msg.state;
         stateVersion = msg.stateVersion;
+        welcomed = true;
+        pushStatus();
         if (typeof onState === "function") {
           onState({ kind: "full", state: msg.state, stateVersion: msg.stateVersion });
         }
+        return;
+      }
+      if (msg.type === MSG.CONNECTION_REJECTED) {
+        wasRejected = true;
+        const reason = typeof msg.reason === "string" ? msg.reason : "denied";
+        if (typeof onConnectionRejected === "function") {
+          try { onConnectionRejected({ reason, target: target ? { ...target } : null }); } catch {}
+        }
+        // Stop retrying — surface the rejection to the renderer instead.
+        target = null;
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        try { ws?.close(); } catch {}
         return;
       }
       if (msg.type === MSG.STATE_PATCH) {
@@ -108,8 +128,9 @@ function makeClient({
     });
     ws.on("close", () => {
       connected = false;
+      welcomed = false;
       pushStatus();
-      scheduleReconnect();
+      if (!wasRejected) scheduleReconnect();
     });
     ws.on("error", () => {
       // 'close' will follow.
@@ -117,11 +138,15 @@ function makeClient({
   }
 
   function scheduleReconnect() {
-    if (reconnectTimer || !target) return;
+    if (reconnectTimer || !target || wasRejected) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (target) connectTo(target);
+      if (target && !wasRejected) connectTo(target);
     }, RECONNECT_MS);
+  }
+
+  function clearRejection() {
+    wasRejected = false;
   }
 
   function sendAction(action) {
@@ -131,6 +156,8 @@ function makeClient({
 
   function disconnect() {
     target = null;
+    wasRejected = false;
+    welcomed = false;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) {
       try { ws.removeAllListeners(); ws.close(); } catch {}
@@ -145,8 +172,10 @@ function makeClient({
     disconnect,
     sendAction,
     status,
+    clearRejection,
     getLastState() { return lastState; },
     isConnected() { return connected; },
+    isWelcomed() { return welcomed; },
     getTarget() { return target; },
   };
 }
