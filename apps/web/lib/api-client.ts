@@ -104,6 +104,7 @@ declare global {
       };
       network?: {
         getStatus(): Promise<NetworkStatusSnapshot>;
+        getState(): Promise<NetworkStateEnvelope | null>;
         setMode(mode: "standalone" | "server" | "client"): Promise<{ ok: boolean; needsImport?: boolean; error?: string }>;
         importLocalState(state: unknown): Promise<{ ok: boolean; error?: string }>;
         sendAction(action: NetworkActionEnvelope): Promise<{ ok: boolean; error?: string }>;

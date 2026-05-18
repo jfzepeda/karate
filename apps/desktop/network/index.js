@@ -30,6 +30,7 @@ let listener = null;
 let mode = "standalone";
 let lastClients = [];
 let lastPending = [];
+let isHostLicensedFn = () => true;
 
 function send(channel, payload) {
   if (mainWindowRef && !mainWindowRef.isDestroyed()) {
@@ -44,6 +45,9 @@ function getTournamentName() {
 
 function announcePayload() {
   if (!server) return null;
+  // Don't advertise an unlicensed host — guests would see it in their
+  // discovered list and try to connect, only to get host_unlicensed.
+  try { if (!isHostLicensedFn()) return null; } catch { return null; }
   const ip = pickServerIp();
   if (!ip) return null;
   const info = server.getAnnounceInfo();
@@ -68,6 +72,15 @@ function pushState() {
     state: store.getState(),
     stateVersion: store.getVersion(),
   });
+}
+
+function getCurrentState() {
+  if (!store) return null;
+  return {
+    kind: "full",
+    state: store.getState(),
+    stateVersion: store.getVersion(),
+  };
 }
 
 function getStatus() {
@@ -148,6 +161,9 @@ async function startServerMode() {
     },
     onConnectionRequest: (req) => {
       send("karate:network-connection-request", req);
+    },
+    isHostLicensed: () => {
+      try { return !!isHostLicensedFn(); } catch { return false; }
     },
     appVersion: APP_VERSION,
     tournamentName: getTournamentName,
@@ -345,13 +361,15 @@ function disconnectClient() {
   }
 }
 
-async function create({ userDataPath: udp, mainWindow }) {
+async function create({ userDataPath: udp, mainWindow, isHostLicensed }) {
   userDataPath = udp;
   mainWindowRef = mainWindow;
+  if (typeof isHostLicensed === "function") isHostLicensedFn = isHostLicensed;
   cfg = networkConfig.load(userDataPath);
   networkConfig.save(userDataPath, cfg); // ensure clientId persisted
 
   ipcMain.handle("karate:network-get-status", () => getStatus());
+  ipcMain.handle("karate:network-get-state", () => getCurrentState());
   ipcMain.handle("karate:network-set-mode", async (_e, m) => setMode(m));
   ipcMain.handle("karate:network-import-local-state", (_e, s) => importLocalState(s));
   ipcMain.handle("karate:network-send-action", (_e, a) => sendAction(a));

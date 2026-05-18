@@ -24,6 +24,7 @@ function makeServer({
   onClientsChanged,
   onConnectionRequest,
   onPendingChanged,
+  isHostLicensed,
   appVersion,
   tournamentName,
 }) {
@@ -272,6 +273,18 @@ function makeServer({
             meta.hostname = String(msg.hostname || "(unknown)");
             meta.role = msg.role === "superadmin" ? "superadmin" : "referee";
             meta.requestedAt = Date.now();
+            // Host must have an active (or grace) license before guests
+            // can join. Reject early so the guest sees a clear message
+            // instead of sitting in the pending queue forever.
+            if (typeof isHostLicensed === "function" && !isHostLicensed()) {
+              try { ws.send(JSON.stringify({
+                type: MSG.CONNECTION_REJECTED,
+                reason: "host_unlicensed",
+              })); } catch {}
+              try { ws.close(); } catch {}
+              clients.delete(ws);
+              return;
+            }
             // Previously-approved client in this session → auto-approve (no
             // re-prompt for renderers that reconnect within the same run).
             if (approvedClientIds.has(meta.clientId)) {

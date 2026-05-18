@@ -49,6 +49,16 @@ export function NetworkProvider({ children }: { children: React.ReactNode }) {
     if (!net) return;
     let cancelled = false;
     net.getStatus().then((s) => { if (!cancelled) setStatus(s); }).catch(() => {});
+    // Re-hydrate the last-known state from the main process. The Electron
+    // main process holds the canonical state across renderer reloads — the
+    // renderer itself only sees future onState events, so without this
+    // fetch a cmd+R during a guest session would leave networkState=null
+    // and the UI would render an empty tournament.
+    net.getState().then((env) => {
+      if (cancelled || !env) return;
+      setNetworkState(env.state as AppState);
+      setNetworkStateVersion(env.stateVersion);
+    }).catch(() => {});
     const offStatus = net.onStatus((s) => setStatus(s));
     const offState = net.onState((env: NetworkStateEnvelope) => {
       setNetworkState(env.state as AppState);

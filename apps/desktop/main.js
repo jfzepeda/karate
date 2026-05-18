@@ -319,6 +319,11 @@ app.whenReady().then(async () => {
   await network.create({
     userDataPath: app.getPath("userData"),
     mainWindow: primaryWindow,
+    // Guests may only connect to a host that has an active (or grace-period)
+    // license — the host's license covers the whole session.
+    isHostLicensed: () =>
+      !!currentState &&
+      (currentState.kind === "active" || currentState.kind === "grace"),
   });
 
   app.on("activate", () => {

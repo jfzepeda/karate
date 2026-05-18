@@ -246,8 +246,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         updateLocal(fn);
         return;
       }
-      const base = networkState ?? buildInitialState();
-      const candidate = deepClone(base);
+      // CRITICAL: never fall back to buildInitialState() here. If the
+      // renderer hasn't received the host's snapshot yet (e.g. immediately
+      // after a cmd+R while connected as a guest), forking from an empty
+      // state and sending REPLACE_STATE would WIPE the host's tournament.
+      // Drop the action and let the user retry once state has hydrated.
+      if (!networkState) {
+        if (typeof window !== "undefined") {
+          console.warn("[karate-store] update dropped: network state not loaded yet");
+        }
+        return;
+      }
+      const candidate = deepClone(networkState);
       fn(candidate);
       void sendAction(Actions.replaceState(candidate));
     },

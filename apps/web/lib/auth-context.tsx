@@ -360,7 +360,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(() => {
     clearSessionToken();
     setToken(null);
-    const license = (typeof window !== "undefined" ? window.__KARATE__?.license : null);
+    const w = typeof window !== "undefined" ? window.__KARATE__ : null;
+    // Guest sessions don't have their own license — just drop the network
+    // connection and return to the LoginScreen.
+    const net = w?.network;
+    if (net) {
+      setGuestSession(null);
+      void net.disconnectClient().catch(() => {});
+      void net.setMode("standalone").catch(() => {});
+    }
+    const license = w?.license;
     if (license) {
       void license.reset();
     }

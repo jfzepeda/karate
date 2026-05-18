@@ -137,6 +137,7 @@ contextBridge.exposeInMainWorld("__KARATE__", {
   // Network / multiplayer surface.
   network: {
     getStatus() { return ipcRenderer.invoke("karate:network-get-status"); },
+    getState() { return ipcRenderer.invoke("karate:network-get-state"); },
     setMode(mode) { return ipcRenderer.invoke("karate:network-set-mode", mode); },
     importLocalState(state) { return ipcRenderer.invoke("karate:network-import-local-state", state); },
     sendAction(action) { return ipcRenderer.invoke("karate:network-send-action", action); },

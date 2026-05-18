@@ -20,6 +20,7 @@ const JOIN_ERROR_COPY: Record<string, string> = {
   denied: "The host rejected the connection.",
   timeout: "The host did not respond in time.",
   kicked: "You were disconnected by the host.",
+  host_unlicensed: "The host needs to activate its license before guests can join.",
   connect_failed: "Could not reach the host. Check the IP and that the host is running.",
   network_unavailable: "Network features are only available in the desktop app.",
   set_mode_failed: "Could not switch to client mode.",

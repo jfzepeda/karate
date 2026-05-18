@@ -10,7 +10,8 @@ export default function Home() {
   const { status, user } = useAuth();
 
   useEffect(() => {
-    if (status.kind !== "authed" || !user) return;
+    if (status.kind !== "authed" && status.kind !== "guest") return;
+    if (!user) return;
     router.replace("/area-select");
   }, [router, status, user]);
 
