@@ -26,6 +26,7 @@ __export(index_exports, {
   BELT_LABEL_EN: () => BELT_LABEL_EN,
   BELT_ORDER: () => BELT_ORDER,
   CHANNEL_NAME: () => CHANNEL_NAME,
+  DEFAULT_ENGINE_CONFIG: () => DEFAULT_ENGINE_CONFIG,
   DEFAULT_KEYS: () => DEFAULT_KEYS,
   KATA_DISABLED_COMMANDS: () => KATA_DISABLED_COMMANDS,
   KEY_LABELS: () => KEY_LABELS,
@@ -38,6 +39,7 @@ __export(index_exports, {
   areaLabel: () => areaLabel,
   assignSubcategoryToArea: () => assignSubcategoryToArea,
   buildAreaPlan: () => buildAreaPlan,
+  buildInitialEngineState: () => buildInitialEngineState,
   buildInitialState: () => buildInitialState,
   buildPlayinTree: () => buildPlayinTree,
   buildRRTree: () => buildRRTree,
@@ -51,6 +53,8 @@ __export(index_exports, {
   categoryHasArea: () => categoryHasArea,
   categoryIdFor: () => categoryIdFor,
   categoryNameFor: () => categoryNameFor,
+  closeCheckIn: () => closeCheckIn,
+  computeAreaStatus: () => computeAreaStatus,
   computeCombatWinner: () => computeCombatWinner,
   computeKataWinner: () => computeKataWinner,
   computeWinner: () => computeWinner,
@@ -60,6 +64,7 @@ __export(index_exports, {
   describeRefLabel: () => describeRefLabel,
   distributeRemainder: () => distributeRemainder,
   emptyMatch: () => emptyMatch,
+  ensureEngineState: () => ensureEngineState,
   finalizeMatchByRef: () => finalizeMatchByRef,
   finalizeRR: () => finalizeRR,
   finalizeSeries: () => finalizeSeries,
@@ -71,8 +76,12 @@ __export(index_exports, {
   getCategory: () => getCategory,
   getMatchByRef: () => getMatchByRef,
   getSubcategory: () => getSubcategory,
+  hydrateEngineFromBracket: () => hydrateEngineFromBracket,
+  listReadyMatches: () => listReadyMatches,
   loadMatchToScoreboardImpl: () => loadMatchToScoreboardImpl,
   loadState: () => loadState,
+  markCompetitorAbsent: () => markCompetitorAbsent,
+  matchIdFromRef: () => matchIdFromRef,
   mulberry32: () => mulberry32,
   newCategoryDefId: () => newCategoryDefId,
   newParticipantId: () => newParticipantId,
@@ -81,12 +90,16 @@ __export(index_exports, {
   rebuildAllSubcategories: () => rebuildAllSubcategories,
   rebuildCategoriesFromParticipants: () => rebuildCategoriesFromParticipants,
   rebuildCategorySubcategories: () => rebuildCategorySubcategories,
+  recordMatchEnd: () => recordMatchEnd,
+  recordMatchStart: () => recordMatchStart,
+  refFromMatchId: () => refFromMatchId,
   removeCategoryDef: () => removeCategoryDef,
   removeParticipant: () => removeParticipant,
   replaceParticipants: () => replaceParticipants,
   reseed: () => reseed,
   resetLiveScoreboard: () => resetLiveScoreboard,
   roundLabel: () => roundLabel,
+  runEngineTick: () => runEngineTick,
   samePath: () => samePath,
   setAreaCount: () => setAreaCount,
   setCategoryDefs: () => setCategoryDefs,
@@ -100,7 +113,8 @@ __export(index_exports, {
   subcategoryStatus: () => subcategoryStatus,
   treeComplete: () => treeComplete,
   treeHasProgress: () => treeHasProgress,
-  updateCategoryDef: () => updateCategoryDef
+  updateCategoryDef: () => updateCategoryDef,
+  updateEngineConfig: () => updateEngineConfig
 });
 module.exports = __toCommonJS(index_exports);
 
@@ -825,7 +839,8 @@ function buildInitialState() {
       defaultDuration: 120,
       keys: { ...DEFAULT_KEYS }
     },
-    jury: null
+    jury: null,
+    engine: void 0
   };
 }
 function loadState(storage) {
@@ -1564,6 +1579,496 @@ function generateMockTournament() {
   ];
   return { categoryDefs: defs, participants };
 }
+
+// ../../packages/core/src/engine-types.ts
+var DEFAULT_ENGINE_CONFIG = {
+  avgMatchDurationSeconds: 180,
+  delayThreshold: 0.85,
+  minRestSeconds: 120,
+  scoreContinuityBonus: 60,
+  scoreDelayPenalty: -50,
+  scoreAdjacencyBonus: 30,
+  scoreCriticalPathBonus: 20,
+  scoreAgingBonus: 15,
+  scoreFreeAreaBonus: 40,
+  scoreRestViolationPenalty: -80,
+  interleaveSearchRadius: 1
+};
+
+// ../../packages/core/src/engine.ts
+function matchIdFromRef(ref) {
+  const { categoryId, subcategoryId, discipline, path } = ref;
+  const base = `${categoryId}::${subcategoryId}::${discipline}`;
+  switch (path.kind) {
+    case "std":
+      return `${base}::std::r${path.round}::i${path.idx}`;
+    case "playin":
+      return `${base}::playin`;
+    case "series":
+      return `${base}::series::m${path.idx}`;
+    case "rr":
+      return `${base}::rr::${path.pair}`;
+    case "3rd":
+      return `${base}::3rd`;
+  }
+}
+function refFromMatchId(id) {
+  const parts = id.split("::");
+  if (parts.length < 4) return null;
+  const [categoryId, subcategoryId, discipline, kind, a, b] = parts;
+  if (discipline !== "combat" && discipline !== "kata") return null;
+  const d = discipline;
+  let path = null;
+  if (kind === "std" && a && b) {
+    const round = parseInt(a.slice(1), 10);
+    const idx = parseInt(b.slice(1), 10);
+    if (Number.isFinite(round) && Number.isFinite(idx)) path = { kind: "std", round, idx };
+  } else if (kind === "playin") {
+    path = { kind: "playin" };
+  } else if (kind === "series" && a) {
+    const idx = parseInt(a.slice(1), 10);
+    if (Number.isFinite(idx)) path = { kind: "series", idx };
+  } else if (kind === "rr" && a) {
+    if (a === "ab" || a === "ac" || a === "bc") path = { kind: "rr", pair: a };
+  } else if (kind === "3rd") {
+    path = { kind: "3rd" };
+  }
+  if (!path) return null;
+  return { categoryId, subcategoryId, discipline: d, path };
+}
+function* iterateSubcategoryMatches(catId, sub) {
+  const disciplines = Object.keys(sub.trees);
+  for (const d of disciplines) {
+    const tree = sub.trees[d];
+    if (!tree) continue;
+    const treeTag = d === "kata" ? "KATA" : "COMBAT";
+    if (sub.type === "standard") {
+      const t = tree;
+      for (let r = 0; r < t.rounds.length; r++) {
+        const round = t.rounds[r];
+        for (let i = 0; i < round.length; i++) {
+          yield {
+            ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "std", round: r, idx: i } },
+            match: round[i],
+            tree: treeTag
+          };
+        }
+      }
+      if (t.thirdPlace) {
+        yield {
+          ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "3rd" } },
+          match: t.thirdPlace,
+          tree: treeTag
+        };
+      }
+    } else if (sub.type === "playin") {
+      const t = tree;
+      yield {
+        ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "playin" } },
+        match: t.extra,
+        tree: treeTag
+      };
+      for (let r = 0; r < t.bracket.rounds.length; r++) {
+        const round = t.bracket.rounds[r];
+        for (let i = 0; i < round.length; i++) {
+          yield {
+            ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "std", round: r, idx: i } },
+            match: round[i],
+            tree: treeTag
+          };
+        }
+      }
+    } else if (sub.type === "series") {
+      const t = tree;
+      for (let i = 0; i < t.matches.length; i++) {
+        yield {
+          ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "series", idx: i } },
+          match: t.matches[i],
+          tree: treeTag
+        };
+      }
+    } else if (sub.type === "roundrobin") {
+      const t = tree;
+      for (const m of t.matches) {
+        if (!m.pair) continue;
+        yield {
+          ref: { categoryId: catId, subcategoryId: sub.id, discipline: d, path: { kind: "rr", pair: m.pair } },
+          match: m,
+          tree: treeTag
+        };
+      }
+    }
+  }
+}
+function* iterateAllMatches(state) {
+  for (const catId of state.tournament.categoryOrder) {
+    const cat = state.tournament.categories[catId];
+    if (!cat) continue;
+    for (const sub of cat.subcategories) {
+      for (const it of iterateSubcategoryMatches(catId, sub)) {
+        yield { ref: it.ref, match: it.match, sub, category: cat, tree: it.tree };
+      }
+    }
+  }
+}
+function buildInitialEngineState() {
+  return {
+    config: { ...DEFAULT_ENGINE_CONFIG },
+    areas: [],
+    matches: {},
+    competitors: {},
+    subcategories: {},
+    nextMatchPerArea: {},
+    assignmentQueue: [],
+    lastTickTs: 0
+  };
+}
+function ensureEngineState(state) {
+  if (!state.engine) state.engine = buildInitialEngineState();
+  const eng = state.engine;
+  const areaCount = state.tournament.settings.areaCount;
+  if (eng.areas.length !== areaCount) {
+    const next = [];
+    for (let i = 0; i < areaCount; i++) {
+      const prev = eng.areas[i];
+      next.push(
+        prev ?? {
+          index: i,
+          name: areaLabel(i),
+          status: "LIBRE",
+          assignedSubcategories: [],
+          matchHistory: [],
+          firstMatchAssignedTs: null,
+          performanceRatio: null
+        }
+      );
+    }
+    eng.areas = next;
+    const filtered = {};
+    for (let i = 0; i < areaCount; i++) filtered[i] = eng.nextMatchPerArea[i] ?? null;
+    eng.nextMatchPerArea = filtered;
+  }
+  return eng;
+}
+function readinessFromBracket(m) {
+  const knownA = !!m.p1;
+  const knownB = !!m.p2;
+  const completed = !!m.winner;
+  const isBye = m.p2 === "BYE" || m.p1 === "BYE";
+  return { knownA, knownB, isBye, completed };
+}
+function hydrateEngineFromBracket(state, now) {
+  const eng = ensureEngineState(state);
+  const subSeen = /* @__PURE__ */ new Set();
+  for (const catId of state.tournament.categoryOrder) {
+    const cat = state.tournament.categories[catId];
+    if (!cat) continue;
+    for (const sub of cat.subcategories) {
+      subSeen.add(sub.id);
+      if (!eng.subcategories[sub.id]) {
+        eng.subcategories[sub.id] = {
+          id: sub.id,
+          checkInStatus: "OPEN",
+          checkInClosedTs: null,
+          officialStartTs: null,
+          actualStartTs: null,
+          completedTs: null,
+          waitingSince: null,
+          assignedAreaIndices: [],
+          absentCompetitors: []
+        };
+      }
+    }
+  }
+  for (const id of Object.keys(eng.subcategories)) {
+    if (!subSeen.has(id)) delete eng.subcategories[id];
+  }
+  const compSeen = /* @__PURE__ */ new Set();
+  for (const catId of state.tournament.categoryOrder) {
+    const cat = state.tournament.categories[catId];
+    if (!cat) continue;
+    for (const sub of cat.subcategories) {
+      for (const name of sub.competitors) {
+        if (!name) continue;
+        compSeen.add(name);
+        if (!eng.competitors[name]) {
+          eng.competitors[name] = {
+            id: name,
+            status: "AVAILABLE",
+            lastMatchEndTs: null,
+            lastAreaIndex: null,
+            currentAreaIndex: null
+          };
+        }
+      }
+    }
+  }
+  for (const id of Object.keys(eng.competitors)) {
+    if (!compSeen.has(id)) delete eng.competitors[id];
+  }
+  const matchSeen = /* @__PURE__ */ new Set();
+  for (const it of iterateAllMatches(state)) {
+    const id = matchIdFromRef(it.ref);
+    matchSeen.add(id);
+    const existing = eng.matches[id];
+    const r = readinessFromBracket(it.match);
+    const tree = it.tree;
+    let status;
+    if (r.completed) status = "COMPLETED";
+    else if (existing?.status === "IN_PROGRESS") status = "IN_PROGRESS";
+    else if (r.knownA && r.knownB && !r.isBye) status = "READY";
+    else status = "PENDING";
+    eng.matches[id] = {
+      id,
+      ref: it.ref,
+      discipline: it.ref.discipline,
+      bracketTree: tree,
+      status,
+      assignedAreaIndex: existing?.assignedAreaIndex ?? null,
+      startTs: existing?.startTs ?? null,
+      endTs: existing?.endTs ?? null,
+      isBye: r.isBye
+    };
+  }
+  for (const id of Object.keys(eng.matches)) {
+    if (!matchSeen.has(id)) delete eng.matches[id];
+  }
+  for (const c of Object.values(eng.competitors)) {
+    refreshCompetitorStatus(c, eng, now);
+  }
+  for (const a of eng.areas) {
+    a.status = computeAreaStatus(a, eng.config, now);
+  }
+  return eng;
+}
+function refreshCompetitorStatus(c, eng, now) {
+  if (c.status === "ABSENT") return "ABSENT";
+  if (c.status === "IN_MATCH") return "IN_MATCH";
+  if (c.lastMatchEndTs && now - c.lastMatchEndTs < eng.config.minRestSeconds * 1e3) {
+    c.status = "RESTING";
+    return "RESTING";
+  }
+  c.status = "AVAILABLE";
+  return "AVAILABLE";
+}
+function computeAreaStatus(area, config, now) {
+  if (!area.firstMatchAssignedTs) {
+    area.performanceRatio = null;
+    return area.assignedSubcategories.length === 0 ? "LIBRE" : "ACTIVA";
+  }
+  const elapsed = Math.max(1, (now - area.firstMatchAssignedTs) / 1e3);
+  const expected = elapsed / Math.max(1, config.avgMatchDurationSeconds);
+  const completed = area.matchHistory.length;
+  const ratio = completed / Math.max(1e-4, expected);
+  area.performanceRatio = ratio;
+  if (area.assignedSubcategories.length === 0 && completed === 0) return "LIBRE";
+  return ratio >= config.delayThreshold ? "ACTIVA" : "RETRASADA";
+}
+function getMatchParticipants(state, ref) {
+  const sub = getSubcategory(state, ref.categoryId, ref.subcategoryId);
+  if (!sub) return { a: null, b: null };
+  const tree = sub.trees[ref.discipline];
+  if (!tree) return { a: null, b: null };
+  if (sub.type === "standard") {
+    const t = tree;
+    if (ref.path.kind === "std") return { a: t.rounds[ref.path.round]?.[ref.path.idx]?.p1 ?? null, b: t.rounds[ref.path.round]?.[ref.path.idx]?.p2 ?? null };
+    if (ref.path.kind === "3rd" && t.thirdPlace) return { a: t.thirdPlace.p1, b: t.thirdPlace.p2 };
+  } else if (sub.type === "playin") {
+    const t = tree;
+    if (ref.path.kind === "playin") return { a: t.extra.p1, b: t.extra.p2 };
+    if (ref.path.kind === "std") return { a: t.bracket.rounds[ref.path.round]?.[ref.path.idx]?.p1 ?? null, b: t.bracket.rounds[ref.path.round]?.[ref.path.idx]?.p2 ?? null };
+  } else if (sub.type === "series") {
+    const t = tree;
+    if (ref.path.kind === "series") return { a: t.matches[ref.path.idx]?.p1 ?? null, b: t.matches[ref.path.idx]?.p2 ?? null };
+  } else if (sub.type === "roundrobin") {
+    const t = tree;
+    if (ref.path.kind === "rr") {
+      const pair = ref.path.pair;
+      const target = t.matches.find((mm) => mm.pair === pair);
+      return { a: target?.p1 ?? null, b: target?.p2 ?? null };
+    }
+  }
+  return { a: null, b: null };
+}
+function restOk(eng, a, b, now) {
+  const minMs = eng.config.minRestSeconds * 1e3;
+  for (const name of [a, b]) {
+    if (!name || name === "BYE") continue;
+    const c = eng.competitors[name];
+    if (!c) continue;
+    if (c.status === "IN_MATCH") return false;
+    if (c.lastMatchEndTs && now - c.lastMatchEndTs < minMs) return false;
+  }
+  return true;
+}
+function kataOrderingOk(state, eng, subcategoryId, discipline, a, b) {
+  if (discipline !== "combat") return true;
+  for (const name of [a, b]) {
+    if (!name) continue;
+    let pending = 0;
+    for (const m of Object.values(eng.matches)) {
+      if (m.ref.subcategoryId !== subcategoryId) continue;
+      if (m.bracketTree !== "KATA") continue;
+      if (m.status === "COMPLETED") continue;
+      const parts = getMatchParticipants(state, m.ref);
+      if (parts.a === name || parts.b === name) pending++;
+    }
+    if (pending > 0) return false;
+  }
+  return true;
+}
+function listReadyMatches(state, now) {
+  const eng = ensureEngineState(state);
+  const out = [];
+  for (const m of Object.values(eng.matches)) {
+    if (m.status !== "READY") continue;
+    const parts = getMatchParticipants(state, m.ref);
+    if (!parts.a || !parts.b) continue;
+    if (parts.a === "BYE" || parts.b === "BYE") continue;
+    if (!restOk(eng, parts.a, parts.b, now)) continue;
+    if (!kataOrderingOk(state, eng, m.ref.subcategoryId, m.ref.discipline, parts.a, parts.b)) continue;
+    out.push({ runtime: m, ref: m.ref, a: parts.a, b: parts.b });
+  }
+  return out;
+}
+function scorePair(ctx, area, m) {
+  const cfg = ctx.eng.config;
+  let score = 0;
+  if (area.assignedSubcategories.includes(m.ref.subcategoryId)) {
+    score += cfg.scoreContinuityBonus;
+  }
+  if (area.status === "LIBRE") score += cfg.scoreFreeAreaBonus;
+  if (area.status === "RETRASADA") score += cfg.scoreDelayPenalty;
+  const compA = ctx.eng.competitors[m.a];
+  const compB = ctx.eng.competitors[m.b];
+  for (const c of [compA, compB]) {
+    if (!c || c.lastAreaIndex === null) continue;
+    if (Math.abs(c.lastAreaIndex - area.index) === 1) {
+      score += cfg.scoreAdjacencyBonus;
+      break;
+    }
+  }
+  const subRuntime = ctx.eng.subcategories[m.ref.subcategoryId];
+  if (subRuntime?.waitingSince) {
+    const ageMs = ctx.now - subRuntime.waitingSince;
+    if (ageMs > 6e4) score += cfg.scoreAgingBonus;
+  }
+  if (m.ref.path.kind === "std" && m.ref.path.round > 0) {
+    score += cfg.scoreCriticalPathBonus;
+  }
+  return score;
+}
+function runEngineTick(state, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const eng = hydrateEngineFromBracket(state, now);
+  eng.lastTickTs = now;
+  for (const a of eng.areas) {
+    a.assignedSubcategories = a.assignedSubcategories.filter((subId) => {
+      const sub = eng.subcategories[subId];
+      if (!sub) return false;
+      if (sub.completedTs) return false;
+      return true;
+    });
+  }
+  const ready = listReadyMatches(state, now);
+  const ctx = { state, eng, now };
+  const usedMatchIds = /* @__PURE__ */ new Set();
+  for (let i = 0; i < eng.areas.length; i++) eng.nextMatchPerArea[i] = null;
+  const areasByPriority = [...eng.areas].sort((x, y) => {
+    const order = (s) => s === "LIBRE" ? 0 : s === "ACTIVA" ? 1 : 2;
+    return order(x.status) - order(y.status);
+  });
+  for (const area of areasByPriority) {
+    let best = null;
+    for (const m of ready) {
+      if (usedMatchIds.has(m.runtime.id)) continue;
+      const sc = scorePair(ctx, area, m);
+      if (!best || sc > best.score) best = { match: m, score: sc };
+    }
+    if (best) {
+      usedMatchIds.add(best.match.runtime.id);
+      const isInterleaved = !area.assignedSubcategories.includes(best.match.ref.subcategoryId) && area.assignedSubcategories.length > 0;
+      const primary = isInterleaved ? area.assignedSubcategories[0] : null;
+      eng.nextMatchPerArea[area.index] = {
+        matchId: best.match.runtime.id,
+        isInterleaved,
+        primarySubcategoryId: primary
+      };
+    }
+  }
+  return eng;
+}
+function closeCheckIn(state, subcategoryId, now) {
+  const eng = ensureEngineState(state);
+  const sub = eng.subcategories[subcategoryId];
+  if (!sub) return;
+  if (sub.checkInStatus === "CLOSED") return;
+  sub.checkInStatus = "CLOSED";
+  sub.checkInClosedTs = now;
+  sub.waitingSince = now;
+  if (!eng.assignmentQueue.includes(subcategoryId)) {
+    eng.assignmentQueue.push(subcategoryId);
+  }
+}
+function recordMatchStart(state, matchId, areaIndex, now) {
+  const eng = ensureEngineState(state);
+  const m = eng.matches[matchId];
+  if (!m) return;
+  m.status = "IN_PROGRESS";
+  m.startTs = now;
+  m.assignedAreaIndex = areaIndex;
+  const area = eng.areas[areaIndex];
+  if (area) {
+    if (!area.firstMatchAssignedTs) area.firstMatchAssignedTs = now;
+    if (!area.assignedSubcategories.includes(m.ref.subcategoryId)) {
+      area.assignedSubcategories.push(m.ref.subcategoryId);
+    }
+  }
+  const parts = getMatchParticipants(state, m.ref);
+  for (const name of [parts.a, parts.b]) {
+    if (!name || name === "BYE") continue;
+    const c = eng.competitors[name];
+    if (!c) continue;
+    c.status = "IN_MATCH";
+    c.currentAreaIndex = areaIndex;
+  }
+  const subRuntime = eng.subcategories[m.ref.subcategoryId];
+  if (subRuntime && !subRuntime.actualStartTs) subRuntime.actualStartTs = now;
+}
+function recordMatchEnd(state, matchId, now) {
+  const eng = ensureEngineState(state);
+  const m = eng.matches[matchId];
+  if (!m) return;
+  m.status = "COMPLETED";
+  m.endTs = now;
+  const areaIdx = m.assignedAreaIndex;
+  if (areaIdx !== null) {
+    const area = eng.areas[areaIdx];
+    if (area && m.startTs) {
+      area.matchHistory.push({ matchId, startTs: m.startTs, endTs: now });
+    }
+  }
+  const parts = getMatchParticipants(state, m.ref);
+  for (const name of [parts.a, parts.b]) {
+    if (!name || name === "BYE") continue;
+    const c = eng.competitors[name];
+    if (!c) continue;
+    c.lastMatchEndTs = now;
+    c.lastAreaIndex = areaIdx;
+    c.currentAreaIndex = null;
+    c.status = "RESTING";
+  }
+}
+function markCompetitorAbsent(state, competitorName) {
+  const eng = ensureEngineState(state);
+  const c = eng.competitors[competitorName];
+  if (!c) return;
+  c.status = "ABSENT";
+}
+function updateEngineConfig(state, patch) {
+  const eng = ensureEngineState(state);
+  eng.config = { ...eng.config, ...patch };
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   AGE_RANGES,
@@ -1572,6 +2077,7 @@ function generateMockTournament() {
   BELT_LABEL_EN,
   BELT_ORDER,
   CHANNEL_NAME,
+  DEFAULT_ENGINE_CONFIG,
   DEFAULT_KEYS,
   KATA_DISABLED_COMMANDS,
   KEY_LABELS,
@@ -1584,6 +2090,7 @@ function generateMockTournament() {
   areaLabel,
   assignSubcategoryToArea,
   buildAreaPlan,
+  buildInitialEngineState,
   buildInitialState,
   buildPlayinTree,
   buildRRTree,
@@ -1597,6 +2104,8 @@ function generateMockTournament() {
   categoryHasArea,
   categoryIdFor,
   categoryNameFor,
+  closeCheckIn,
+  computeAreaStatus,
   computeCombatWinner,
   computeKataWinner,
   computeWinner,
@@ -1606,6 +2115,7 @@ function generateMockTournament() {
   describeRefLabel,
   distributeRemainder,
   emptyMatch,
+  ensureEngineState,
   finalizeMatchByRef,
   finalizeRR,
   finalizeSeries,
@@ -1617,8 +2127,12 @@ function generateMockTournament() {
   getCategory,
   getMatchByRef,
   getSubcategory,
+  hydrateEngineFromBracket,
+  listReadyMatches,
   loadMatchToScoreboardImpl,
   loadState,
+  markCompetitorAbsent,
+  matchIdFromRef,
   mulberry32,
   newCategoryDefId,
   newParticipantId,
@@ -1627,12 +2141,16 @@ function generateMockTournament() {
   rebuildAllSubcategories,
   rebuildCategoriesFromParticipants,
   rebuildCategorySubcategories,
+  recordMatchEnd,
+  recordMatchStart,
+  refFromMatchId,
   removeCategoryDef,
   removeParticipant,
   replaceParticipants,
   reseed,
   resetLiveScoreboard,
   roundLabel,
+  runEngineTick,
   samePath,
   setAreaCount,
   setCategoryDefs,
@@ -1646,5 +2164,6 @@ function generateMockTournament() {
   subcategoryStatus,
   treeComplete,
   treeHasProgress,
-  updateCategoryDef
+  updateCategoryDef,
+  updateEngineConfig
 });

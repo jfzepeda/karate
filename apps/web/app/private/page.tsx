@@ -6,6 +6,7 @@ import { useStore } from "@/lib/store";
 import { Scoreboard } from "@/components/scoreboard";
 import { KeyboardHandler } from "@/components/keyboard-handler";
 import { SettingsModal } from "@/components/settings-modal";
+import { NextMatchPanel } from "@/components/next-match-panel";
 import { isElectron } from "@/lib/api-client";
 
 function openPublicDisplay() {
@@ -48,6 +49,7 @@ export default function PrivatePage() {
   return (
     <section id="view-private" style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 44px)" }}>
       <KeyboardHandler suppress={settingsOpen || !!state.jury} />
+      <NextMatchPanel />
       <Scoreboard state={state} variant="private" />
       <div className="private-controls">
         <div className="control-group">

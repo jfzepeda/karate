@@ -72,9 +72,18 @@ const handlers = {
     if (!ref) throw new ActionRejectedError("invalid", "missing ref");
     core.loadMatchToScoreboardImpl(s, ref);
   },
-  ADVANCE_WINNER(s) {
-    const ref = s.match.activeMatchRef;
+  ADVANCE_WINNER(s, payload) {
+    // The client may pass a `ref` (for machines that hold match-selection
+    // locally and never broadcast a SELECT_MATCH). Fall back to the
+    // server's currently-loaded match if the caller didn't provide one.
+    const ref = (payload && payload.ref) || s.match.activeMatchRef;
     if (!ref) return;
+    // Ensure scoreboard names line up with the requested ref so the
+    // existing checkCombatWin / computeWinner logic works correctly even
+    // when the operator's machine had a local-only selection.
+    if (!s.match.activeMatchRef || core.matchIdFromRef(s.match.activeMatchRef) !== core.matchIdFromRef(ref)) {
+      core.loadMatchToScoreboardImpl(s, ref);
+    }
     const m = core.getMatchByRef(s, ref);
     if (!m || m.winner) return;
     s.match.discipline = ref.discipline;
@@ -98,12 +107,17 @@ const handlers = {
     const next = core.findNextMatch(s, ref);
     if (next) core.loadMatchToScoreboardImpl(s, next);
   },
-  ELIMINATE(s, { side }) {
+  ELIMINATE(s, { side, ref: refArg }) {
     if (side === "blue") s.match.blueEliminated = true;
     else s.match.redEliminated = true;
     s.timer.running = false;
-    const ref = s.match.activeMatchRef;
+    const ref = refArg || s.match.activeMatchRef;
     if (!ref) return;
+    if (!s.match.activeMatchRef || core.matchIdFromRef(s.match.activeMatchRef) !== core.matchIdFromRef(ref)) {
+      core.loadMatchToScoreboardImpl(s, ref);
+      if (side === "blue") s.match.blueEliminated = true;
+      else s.match.redEliminated = true;
+    }
     s.match.discipline = ref.discipline;
     const threshold = s.tournament.settings.pointDifference ?? 0;
     const winnerSide = core.computeWinner(

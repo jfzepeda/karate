@@ -262,4 +262,10 @@ export interface AppState {
   timer: TimerState;
   settings: AppSettings;
   jury: JuryState | null;
+  /**
+   * Match-assignment engine runtime view. Hydrated lazily by the engine on
+   * the server; safe to be `undefined` on older persisted states (the engine
+   * rebuilds from the bracket on first tick after load).
+   */
+  engine?: import("./engine-types").EngineState;
 }

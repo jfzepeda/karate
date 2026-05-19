@@ -47,6 +47,7 @@ import {
 } from "@karate/core";
 import type { Participant } from "@karate/core";
 import { isActionable, useNetwork } from "./network-context";
+import { useLocalState } from "./local-state-context";
 import * as Actions from "./store-actions";
 import {
   OPTIMISTIC_TIMEOUT_MS,
@@ -118,6 +119,79 @@ function deepClone<T>(x: T): T {
     : JSON.parse(JSON.stringify(x));
 }
 
+function applyLocalActiveMatch(state: AppState, ref: ActiveMatchRef): AppState {
+  // Look up the bracket match for the local ref and project it onto
+  // state.match so the scoreboard renders THIS machine's loaded match
+  // (independent of what the server's global state.match currently says).
+  const sub = state.tournament.categories[ref.categoryId]?.subcategories.find((s) => s.id === ref.subcategoryId);
+  if (!sub) return state;
+  let p1: string | null = null;
+  let p2: string | null = null;
+  const tree = sub.trees[ref.discipline] as unknown as {
+    rounds?: Array<Array<{ p1: string | null; p2: string | null }>>;
+    bracket?: { rounds: Array<Array<{ p1: string | null; p2: string | null }>> };
+    extra?: { p1: string | null; p2: string | null };
+    matches?: Array<{ p1: string | null; p2: string | null; pair?: string }>;
+    thirdPlace?: { p1: string | null; p2: string | null };
+  } | undefined;
+  if (!tree) return state;
+  if (ref.path.kind === "std") {
+    const rounds = tree.rounds ?? tree.bracket?.rounds;
+    const m = rounds?.[ref.path.round]?.[ref.path.idx];
+    if (m) { p1 = m.p1; p2 = m.p2; }
+  } else if (ref.path.kind === "playin") {
+    if (tree.extra) { p1 = tree.extra.p1; p2 = tree.extra.p2; }
+  } else if (ref.path.kind === "series") {
+    const m = tree.matches?.[ref.path.idx];
+    if (m) { p1 = m.p1; p2 = m.p2; }
+  } else if (ref.path.kind === "rr") {
+    const m = tree.matches?.find((mm) => mm.pair === (ref.path as { kind: "rr"; pair: string }).pair);
+    if (m) { p1 = m.p1; p2 = m.p2; }
+  } else if (ref.path.kind === "3rd") {
+    if (tree.thirdPlace) { p1 = tree.thirdPlace.p1; p2 = tree.thirdPlace.p2; }
+  }
+  // Compare to server's current activeMatchRef; if identical, preserve the
+  // server's scoring values (so a single-machine session still works the
+  // way it always did). Otherwise, reset to a blank scoreboard locally —
+  // another machine's scoring activity must not bleed into ours.
+  const serverRef = state.match.activeMatchRef;
+  const sameAsServer = serverRef
+    && serverRef.categoryId === ref.categoryId
+    && serverRef.subcategoryId === ref.subcategoryId
+    && serverRef.discipline === ref.discipline
+    && JSON.stringify(serverRef.path) === JSON.stringify(ref.path);
+  if (sameAsServer) {
+    return {
+      ...state,
+      match: {
+        ...state.match,
+        activeMatchRef: ref,
+        blueName: p1 ?? state.match.blueName,
+        redName: p2 ?? state.match.redName,
+        discipline: ref.discipline,
+      },
+    };
+  }
+  return {
+    ...state,
+    match: {
+      ...state.match,
+      activeMatchRef: ref,
+      blueName: p1 ?? "",
+      redName: p2 ?? "",
+      bluePoints: 0,
+      redPoints: 0,
+      bluePenalties: 0,
+      redPenalties: 0,
+      blueAdvantage: false,
+      redAdvantage: false,
+      blueEliminated: false,
+      redEliminated: false,
+      discipline: ref.discipline,
+    },
+  };
+}
+
 function mergeOptimistic(state: AppState, optimistic: OptimisticMap): AppState {
   if (optimistic.size === 0) return state;
   const blueDelta = deltaForSide(optimistic, "blue");
@@ -142,6 +216,7 @@ function sendAction(env: ReturnType<typeof Actions.scorePoint>): Promise<{ ok: b
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const { status, networkState, networkStateVersion } = useNetwork();
+  const { localActiveMatchRef, setLocalActiveMatchRef } = useLocalState();
   const mode = status.mode;
   const actionable = isActionable(status);
 
@@ -321,8 +396,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [mode, networkState]);
 
   // ---- Effective state used by all consumers ----
+  // Per Addition 2: in networked modes, the "which match is loaded on this
+  // machine" is local state, not server state. Override `state.match` from
+  // the bracket lookup of the local ref so each machine sees its own match.
   const baseState = mode === "standalone" ? localState : (networkState ?? buildInitialState());
-  const state = mergeOptimistic(baseState, optimistic);
+  const stateWithLocalMatch =
+    mode !== "standalone" && localActiveMatchRef
+      ? applyLocalActiveMatch(baseState, localActiveMatchRef)
+      : baseState;
+  const state = mergeOptimistic(stateWithLocalMatch, optimistic);
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -413,10 +495,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       loadMatch: (ref) => {
         if (mode === "standalone") {
           updateLocal((s) => { loadMatchToScoreboardImpl(s, ref); });
-        } else {
-          if (!actionable) return;
-          sendNamed(Actions.selectMatch(ref));
+          return;
         }
+        // Per Addition 2: match selection is LOCAL in networked modes.
+        // Do NOT send to the server. Other machines must not be affected.
+        setLocalActiveMatchRef(ref);
       },
       advanceActiveMatch: () => {
         if (mode === "standalone") {
@@ -440,7 +523,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           });
         } else {
           if (!actionable) return;
-          sendNamed(Actions.advanceWinner());
+          // Pass local ref so the server finalizes the correct match
+          // even when match selection is held only on this machine.
+          sendNamed(Actions.advanceWinner(localActiveMatchRef ?? stateRef.current.match.activeMatchRef ?? undefined));
+          // Clear local selection — bracket has advanced, the operator will
+          // pick the next match.
+          if (localActiveMatchRef) setLocalActiveMatchRef(null);
         }
       },
       resolveJury: (chosenName) => {
@@ -588,7 +676,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           });
         } else {
           if (!actionable) return;
-          sendNamed(Actions.eliminate(side));
+          sendNamed(Actions.eliminate(side, localActiveMatchRef ?? stateRef.current.match.activeMatchRef ?? undefined));
+          if (localActiveMatchRef) setLocalActiveMatchRef(null);
         }
       },
       addPoints: (side, n) => dispatchScore(side, n),
@@ -651,7 +740,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
       },
     }),
-    [state, update, updateLocal, mode, actionable, networkState]
+    [state, update, updateLocal, mode, actionable, networkState, localActiveMatchRef, setLocalActiveMatchRef]
   );
 
   return (

@@ -31,6 +31,7 @@ function makeServer({
   let wss = null;
   let timerInterval = null;
   let pingInterval = null;
+  let engineInterval = null;
   let prevTimerRemaining = store.getState().timer.remaining;
   const clients = new Map(); // ws → meta
   const approvedClientIds = new Set(); // clientIds approved this session
@@ -221,6 +222,24 @@ function makeServer({
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
   }
 
+  function startEngineHeartbeat() {
+    if (engineInterval) return;
+    // Delay-detection / next-match-hint refresh. The engine is also ticked
+    // synchronously after every action; this heartbeat catches passive
+    // changes (rest timers expiring, areas falling behind expected pace)
+    // without waiting for the next operator action.
+    engineInterval = setInterval(() => {
+      if (typeof store.tickEngineOnly === "function") {
+        store.tickEngineOnly();
+        broadcastState();
+      }
+    }, 30000);
+  }
+
+  function stopEngineHeartbeat() {
+    if (engineInterval) { clearInterval(engineInterval); engineInterval = null; }
+  }
+
   function getAnnounceInfo() {
     return {
       serverId,
@@ -241,6 +260,7 @@ function makeServer({
       wss.on("listening", () => {
         startTimerTick();
         startPingLoop();
+        startEngineHeartbeat();
         resolve({ port, serverId });
       });
       wss.on("error", (err) => {
@@ -364,6 +384,7 @@ function makeServer({
   async function stop() {
     stopTimerTick();
     stopPingLoop();
+    stopEngineHeartbeat();
     for (const [ws] of clients) {
       try { ws.close(); } catch {}
     }

@@ -75,6 +75,7 @@ export function buildInitialState(): AppState {
       keys: { ...DEFAULT_KEYS },
     },
     jury: null,
+    engine: undefined,
   };
 }
 

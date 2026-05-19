@@ -34,11 +34,14 @@ export function resetScoreboard(): NetworkActionEnvelope {
 export function selectMatch(ref: ActiveMatchRef): NetworkActionEnvelope {
   return { actionId: id(), actionType: "SELECT_MATCH", payload: { ref }, ts: Date.now() };
 }
-export function advanceWinner(): NetworkActionEnvelope {
-  return { actionId: id(), actionType: "ADVANCE_WINNER", payload: {}, ts: Date.now() };
+export function advanceWinner(ref?: ActiveMatchRef): NetworkActionEnvelope {
+  // ref is included so machines with local-only match selection can drive
+  // bracket advancement on the correct match without first broadcasting a
+  // SELECT_MATCH (which would clobber other machines' loaded matches).
+  return { actionId: id(), actionType: "ADVANCE_WINNER", payload: { ref }, ts: Date.now() };
 }
-export function eliminate(side: "blue" | "red"): NetworkActionEnvelope {
-  return { actionId: id(), actionType: "ELIMINATE", payload: { side }, ts: Date.now() };
+export function eliminate(side: "blue" | "red", ref?: ActiveMatchRef): NetworkActionEnvelope {
+  return { actionId: id(), actionType: "ELIMINATE", payload: { side, ref }, ts: Date.now() };
 }
 export function setActiveCategory(catId: string): NetworkActionEnvelope {
   return { actionId: id(), actionType: "SET_ACTIVE_CATEGORY", payload: { catId }, ts: Date.now() };
