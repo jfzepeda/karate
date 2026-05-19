@@ -160,6 +160,7 @@ async function startServerMode() {
       pushStatus();
     },
     onConnectionRequest: (req) => {
+      console.log("[karate-debug-connection] (host main) forwarding connection request to renderer:", req.hostname, req.clientId);
       send("karate:network-connection-request", req);
     },
     isHostLicensed: () => {
@@ -181,10 +182,12 @@ function startClientMode() {
     clientId: cfg.clientId,
     appVersion: APP_VERSION,
     onState: ({ state, stateVersion }) => {
-      store.replaceAll(state);
+      console.log("[karate-debug-connection] (guest main) received state from host, version=", stateVersion, "bytes~=", JSON.stringify(state).length);
+      try { store.replaceAll(state); } catch (err) { console.warn("[karate-debug-connection] replaceAll threw:", err && err.message); }
       send("karate:network-state", { kind: "full", state, stateVersion });
+      console.log("[karate-debug-connection] (guest main) forwarded state IPC to renderer");
     },
-    onStatus: () => pushStatus(),
+    onStatus: () => { console.log("[karate-debug-connection] (guest main) client status changed:", JSON.stringify(client?.status())); pushStatus(); },
     onAck: (msg) => send("karate:network-action-ack", msg),
     onRejected: (msg) => send("karate:network-action-rejected", msg),
     onConnectionRejected: (msg) => send("karate:network-connection-rejected", msg),

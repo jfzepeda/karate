@@ -103,6 +103,7 @@ function makeServer({
   }
 
   function sendWelcome(ws, meta) {
+    console.log("[karate-debug-connection] sendWelcome → clientId=", meta.clientId, "stateBytes=", JSON.stringify(store.getState()).length);
     try { ws.send(JSON.stringify({
       type: MSG.WELCOME,
       serverId,
@@ -116,10 +117,11 @@ function makeServer({
   }
 
   function approveConnection(clientId) {
+    console.log("[karate-debug-connection] approveConnection called for clientId=", clientId);
     const hit = findWsByClientId(clientId);
-    if (!hit) return { ok: false, error: "not_found" };
+    if (!hit) { console.log("[karate-debug-connection] approveConnection: not_found"); return { ok: false, error: "not_found" }; }
     const { ws, meta } = hit;
-    if (meta.status !== "pending") return { ok: false, error: "not_pending" };
+    if (meta.status !== "pending") { console.log("[karate-debug-connection] approveConnection: not_pending, status=", meta.status); return { ok: false, error: "not_pending" }; }
     if (meta.pendingTimeout) {
       clearTimeout(meta.pendingTimeout);
       meta.pendingTimeout = null;
@@ -287,8 +289,12 @@ function makeServer({
           const msg = safeParse(data.toString("utf8"));
           if (!msg) return;
           if (msg.type === MSG.HELLO) {
+            console.log("[karate-debug-connection] HELLO received from", msg.hostname, msg.clientId, "ip=", ip);
             // Idempotent: re-HELLO from an already-approved socket is a no-op.
-            if (meta.status === "approved") return;
+            if (meta.status === "approved") {
+              console.log("[karate-debug-connection] HELLO ignored — already approved");
+              return;
+            }
             meta.clientId = String(msg.clientId || crypto.randomUUID());
             meta.hostname = String(msg.hostname || "(unknown)");
             meta.role = msg.role === "superadmin" ? "superadmin" : "referee";
@@ -297,6 +303,7 @@ function makeServer({
             // can join. Reject early so the guest sees a clear message
             // instead of sitting in the pending queue forever.
             if (typeof isHostLicensed === "function" && !isHostLicensed()) {
+              console.log("[karate-debug-connection] HELLO rejected — host_unlicensed");
               try { ws.send(JSON.stringify({
                 type: MSG.CONNECTION_REJECTED,
                 reason: "host_unlicensed",
@@ -308,11 +315,13 @@ function makeServer({
             // Previously-approved client in this session → auto-approve (no
             // re-prompt for renderers that reconnect within the same run).
             if (approvedClientIds.has(meta.clientId)) {
+              console.log("[karate-debug-connection] auto-approving previously-known clientId");
               meta.status = "approved";
               sendWelcome(ws, meta);
               sendClientList();
               return;
             }
+            console.log("[karate-debug-connection] queued PENDING — awaiting host approval");
             meta.status = "pending";
             meta.pendingTimeout = setTimeout(() => {
               if (meta.status !== "pending") return;

@@ -224,6 +224,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     net.getStatus().then((s) => {
       if (cancelled) return;
+      console.log("[karate-debug-connection] (renderer) initial net.getStatus →", s.mode, "welcomed=", s.welcomed, "serverInfo?", !!s.serverInfo);
       if (s.mode === "client" && s.welcomed && s.serverInfo) {
         setGuestSession({
           serverId: s.serverInfo.serverId,
@@ -234,6 +235,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }).catch(() => {});
     const offStatus = net.onStatus((s) => {
+      console.log("[karate-debug-connection] (renderer) net.onStatus →", s.mode, "welcomed=", s.welcomed, "serverInfo?", !!s.serverInfo);
       if (s.mode === "client" && s.welcomed && s.serverInfo) {
         setGuestSession((prev) => ({
           serverId: s.serverInfo!.serverId,
